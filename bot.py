@@ -1,629 +1,786 @@
 import os
 import re
-import io
 import asyncio
-import datetime as dt
-from typing import Dict, Any, Optional, List
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart
-from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from aiogram.types import Message, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
 
 import gspread
 from google.oauth2.service_account import Credentials
+
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
 
 
 # =========================
-# CONFIG (редагуй тут, якщо треба)
-# =========================
-
-# Дні зйомок (вкладки у Google Sheet) — як ти просила: "10.01.2026" тощо
-SHOOT_DATES = [
-    "10.01.2026",
-    "11.01.2026",
-    "13.01.2026",
-    "14.01.2026",
-    "17.01.2026",
-    "18.01.2026",
-    "20.01.2026",
-    "21.01.2026",
-]
-
-# Тайм-слоти
-SHOOT_TIMES = ["10:20", "11:00", "11:40", "12:30", "13:20"]
-
-# Константи для релізів
-NAMEPRINT_CONST = "Stanislav Maspanov"
-SHOOTPLACE_CONST = "Ukraine"
-SHOOTSTATE_CONST = "Kyiv"
-
-# Статуси, які менеджер може виставляти в таблиці
-STATUS_APPROVED = "approved"
-STATUS_REJECTED = "rejected"
-
-# Як часто перевіряти таблицю на нові апруви/реджекти (сек)
-POLL_SECONDS = 30
-
-
-# =========================
-# ENV + Google clients
+# CONFIG
 # =========================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
-GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()  # можна лишити пустим, тоді фото не вантажимо
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "service_account.json").strip()
+GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()  # optional but recommended
+SERVICE_ACCOUNT_PATH = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "service_account.json").strip()
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is empty in .env / Railway Variables")
-if not GOOGLE_SHEET_ID:
-    raise RuntimeError("GOOGLE_SHEET_ID is empty in .env / Railway Variables")
+# Fixed values for release sheet
+FIXED_NAMEPRINT = "Stanislav Maspanov"
+FIXED_SHOOTPLACE = "Ukraine"
+FIXED_SHOOTSTATE = "Kyiv"
 
-# Права для Sheets + Drive
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
+# Shoot dates + time slots (user-facing)
+SHOOT_DATES = [
+    "10.01.2026", "11.01.2026", "13.01.2026", "14.01.2026",
+    "17.01.2026", "18.01.2026", "20.01.2026", "21.01.2026",
+]
+TIME_SLOTS = ["10:20", "11:00", "11:40", "12:30", "13:20"]
+
+# Sheet columns (per tab/day)
+HEADERS = [
+    "Nameprint", "DateSigned", "ShootDate", "ShootPlace", "ShootState",
+    "ModelName", "DateOfBirth", "ResidenceAddress", "City", "State", "Country",
+    "ZipCode", "Phone", "Email", "GuardianName", "DateSigneded", "Photo",
+    "TelegramChatId", "Status", "NotifiedAt",
 ]
 
-if not os.path.exists(GOOGLE_SERVICE_ACCOUNT_JSON):
-    raise RuntimeError(f"{GOOGLE_SERVICE_ACCOUNT_JSON} not found in project folder")
-
-creds = Credentials.from_service_account_file(GOOGLE_SERVICE_ACCOUNT_JSON, scopes=SCOPES)
-gc = gspread.authorize(creds)
-sheets_doc = gc.open_by_key(GOOGLE_SHEET_ID)
-
-drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+STATUS_VALUES = ["pending", "approved", "rejected"]  # in sheet we keep simple + stable
 
 
 # =========================
-# Helpers
+# HELPERS: validation + formatting
 # =========================
 
-def ua_date_to_mmddyyyy(dotted: str) -> str:
-    # "17.05.1994" -> "05/17/1994"
-    m = re.fullmatch(r"\s*(\d{1,2})\.(\d{1,2})\.(\d{4})\s*", dotted)
-    if not m:
-        raise ValueError("bad date")
-    dd, mm, yyyy = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    return f"{mm:02d}/{dd:02d}/{yyyy:04d}"
+ENGLISH_RE = re.compile(r"^[A-Za-z0-9\s\-\.'(),/]+$")  # allow basic punctuation
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+PHONE_RE = re.compile(r"^380\d{9}$")  # 380 + 9 digits
 
-def shootdate_to_mmddyyyy(dotted: str) -> str:
-    # вкладки у нас "10.01.2026" -> "01/10/2026"
-    return ua_date_to_mmddyyyy(dotted)
+def is_english_like(s: str) -> bool:
+    s = s.strip()
+    return bool(s) and bool(ENGLISH_RE.match(s))
+
+def to_mmddyyyy(ddmmyyyy: str) -> str:
+    # dd.mm.yyyy -> mm/dd/yyyy
+    dd, mm, yyyy = ddmmyyyy.split(".")
+    return f"{mm}/{dd}/{yyyy}"
 
 def now_iso() -> str:
-    return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-def only_english(text: str) -> bool:
-    # дозволяємо латиницю, пробіли, дефіси, апостроф, крапки, коми
-    return bool(re.fullmatch(r"[A-Za-z0-9\s\-\.'\,/]+", text.strip()))
 
-def clean_spaces(s: str) -> str:
-    return re.sub(r"\s+", " ", s.strip())
+# =========================
+# Google clients
+# =========================
 
-def is_phone_ua(s: str) -> bool:
-    return bool(re.fullmatch(r"380\d{9}", s.strip()))
+def get_gspread_client() -> gspread.Client:
+    if not os.path.exists(SERVICE_ACCOUNT_PATH):
+        raise RuntimeError(f"service account file not found: {SERVICE_ACCOUNT_PATH}")
 
-def ensure_tab_exists(tab_name: str):
-    try:
-        sheets_doc.worksheet(tab_name)
-        return
-    except Exception:
-        sheets_doc.add_worksheet(title=tab_name, rows=2000, cols=40)
-
-def ensure_headers(tab_name: str, required_headers: List[str]):
-    ws = sheets_doc.worksheet(tab_name)
-    row1 = ws.row_values(1)
-    if not row1:
-        ws.update("A1", [required_headers])
-        return
-
-    # якщо колонки частково є — додаємо відсутні в кінець
-    existing = [h.strip() for h in row1]
-    to_add = [h for h in required_headers if h not in existing]
-    if to_add:
-        new_headers = existing + to_add
-        ws.update("A1", [new_headers])
-
-def ensure_all_tabs_and_headers():
-    # базовий набір колонок релізу + наші службові
-    headers = [
-        "Nameprint",
-        "DateSigned",
-        "ShootDate",
-        "ShootPlace",
-        "ShootState",
-        "ModelName",
-        "DateOfBirth",
-        "ResidenceAddress",
-        "City",
-        "State",
-        "Country",
-        "ZipCode",
-        "Phone",
-        "Email",
-        "GuardianName",
-        "DateSigneded",
-        "Photo",
-        # Нові, як ти просила:
-        "TelegramChatId",
-        "Status",
-        "NotifiedAt",
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
     ]
+    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_PATH, scopes=scopes)
+    return gspread.authorize(creds)
 
+def get_sheets_service():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_PATH, scopes=scopes)
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+def get_drive_service():
+    # uses same service account (simpler + stable for Railway)
+    scopes = [
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_PATH, scopes=scopes)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+# =========================
+# Sheet setup: tabs + headers + dropdown validation
+# =========================
+
+def ensure_tab_and_headers(gclient: gspread.Client, sheets_service, tab_name: str) -> None:
+    sh = gclient.open_by_key(GOOGLE_SHEET_ID)
+
+    # Create tab if missing
+    try:
+        ws = sh.worksheet(tab_name)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=tab_name, rows=2000, cols=max(30, len(HEADERS) + 5))
+        # Freeze header row
+        ws.freeze(rows=1)
+
+    # Ensure headers (row 1)
+    current = ws.row_values(1)
+    if current != HEADERS:
+        ws.resize(rows=max(ws.row_count, 2000), cols=max(ws.col_count, len(HEADERS) + 2))
+        ws.update("A1", [HEADERS])
+        ws.freeze(rows=1)
+
+    # Ensure dropdown for Status column (data validation)
+    try:
+        # Find sheetId + Status column index
+        spreadsheet = sheets_service.spreadsheets().get(
+            spreadsheetId=GOOGLE_SHEET_ID
+        ).execute()
+        sheet_id = None
+        for s in spreadsheet.get("sheets", []):
+            props = s.get("properties", {})
+            if props.get("title") == tab_name:
+                sheet_id = props.get("sheetId")
+                break
+        if sheet_id is None:
+            return
+
+        status_col_index = HEADERS.index("Status")  # 0-based
+        # Apply validation to rows 2..2000 in that column
+        req = {
+            "requests": [{
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,
+                        "endRowIndex": 2000,
+                        "startColumnIndex": status_col_index,
+                        "endColumnIndex": status_col_index + 1,
+                    },
+                    "rule": {
+                        "condition": {
+                            "type": "ONE_OF_LIST",
+                            "values": [{"userEnteredValue": v} for v in ["approved", "rejected", "pending"]],
+                        },
+                        "strict": True,
+                        "showCustomUi": True
+                    }
+                }
+            }]
+        }
+        sheets_service.spreadsheets().batchUpdate(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            body=req
+        ).execute()
+    except Exception:
+        # Don't block bot if Google API validation fails
+        pass
+
+
+def ensure_all_tabs_once():
+    gclient = get_gspread_client()
+    sheets_service = get_sheets_service()
     for d in SHOOT_DATES:
-        ensure_tab_exists(d)
-        ensure_headers(d, headers)
+        ensure_tab_and_headers(gclient, sheets_service, d)
 
-def append_row(tab_name: str, row: Dict[str, Any]):
-    ws = sheets_doc.worksheet(tab_name)
-    headers = ws.row_values(1)
-    # підстраховка: якщо раптом заголовки не ті
-    if not headers:
-        ensure_all_tabs_and_headers()
-        headers = ws.row_values(1)
 
-    values = []
-    for h in headers:
-        values.append(row.get(h, ""))
+# =========================
+# Drive upload
+# =========================
 
-    ws.append_row(values, value_input_option="USER_ENTERED")
-
-def find_duplicate_name(tab_name: str, model_name: str) -> bool:
-    ws = sheets_doc.worksheet(tab_name)
-    headers = ws.row_values(1)
-    if not headers or "ModelName" not in headers:
-        return False
-    col = headers.index("ModelName") + 1
-    col_vals = ws.col_values(col)[1:]  # без заголовка
-    norm = model_name.strip().lower()
-    return any((v or "").strip().lower() == norm for v in col_vals)
-
-def upload_photo_to_drive(file_bytes: bytes, filename: str) -> str:
+async def upload_photo_to_drive(bot: Bot, file_id: str, filename: str) -> str:
+    """
+    Upload Telegram photo to Google Drive folder.
+    Returns Drive webViewLink OR fileId if link unavailable.
+    """
     if not GOOGLE_DRIVE_FOLDER_ID:
-        return ""  # фото не вантажимо
-    media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype="image/jpeg", resumable=False)
-    body = {"name": filename, "parents": [GOOGLE_DRIVE_FOLDER_ID]}
-    created = drive.files().create(body=body, media_body=media, fields="id").execute()
-    return created.get("id", "")
+        # fallback: store Telegram file_id
+        return file_id
 
-def set_cell(ws, row_idx: int, col_name: str, value: str):
-    headers = ws.row_values(1)
-    if col_name not in headers:
-        return
-    col_idx = headers.index(col_name) + 1
-    ws.update_cell(row_idx, col_idx, value)
+    drive = get_drive_service()
 
-def get_col(ws, col_name: str) -> Optional[int]:
-    headers = ws.row_values(1)
-    if not headers or col_name not in headers:
-        return None
-    return headers.index(col_name) + 1
+    # download from telegram to tmp
+    tg_file = await bot.get_file(file_id)
+    tmp_path = f"/tmp/{filename}"
+    await bot.download_file(tg_file.file_path, destination=tmp_path)
 
-
-# =========================
-# Bot state (простий словник по chat_id)
-# =========================
-
-FORM: Dict[int, Dict[str, Any]] = {}
-
-def reset_form(chat_id: int):
-    FORM[chat_id] = {
-        "ShootDateHuman": "",
-        "ShootTime": "",
-        "ModelName": "",
-        "DateOfBirth": "",
-        "Phone": "",
-        "Email": "",
-        "ResidenceAddress": "",
-        "City": "",
-        "ZipCode": "",
-        "GuardianName": "",
-        "PhotoFileId": "",
-        "PhotoDriveId": "",
-        "SkipAddress": False,
+    media = MediaFileUpload(tmp_path, mimetype="image/jpeg", resumable=False)
+    body = {
+        "name": filename,
+        "parents": [GOOGLE_DRIVE_FOLDER_ID],
     }
+    created = drive.files().create(
+        body=body,
+        media_body=media,
+        fields="id, webViewLink"
+    ).execute()
+
+    # optional: make it readable by link (comment out if you want private)
+    try:
+        drive.permissions().create(
+            fileId=created["id"],
+            body={"type": "anyone", "role": "reader"},
+        ).execute()
+    except Exception:
+        pass
+
+    return created.get("webViewLink") or created.get("id")
+
+
+# =========================
+# FSM
+# =========================
+
+class Form(StatesGroup):
+    pick_date = State()
+    pick_time = State()
+    model_name = State()
+    dob = State()
+    phone = State()
+    email = State()
+    country = State()
+    guardian = State()
+    address = State()
+    city = State()
+    photo = State()
+
+
+@dataclass
+class Draft:
+    shoot_date_ddmmyyyy: str = ""
+    shoot_time: str = ""
+    model_name: str = ""
+    dob_ddmmyyyy: str = ""
+    phone: str = ""
+    email: str = ""
+    country: str = ""
+    guardian: str = ""
+    address: str = ""
+    city: str = ""
+
+
+# =========================
+# UI builders (NO persistent keyboard)
+# =========================
 
 def kb_start():
-    rb = ReplyKeyboardBuilder()
-    rb.button(text="📝 Подати заявку на зйомку")
-    rb.adjust(1)
-    return rb.as_markup(resize_keyboard=True)
+    b = InlineKeyboardBuilder()
+    b.button(text="📝 Подати заявку на зйомку", callback_data="apply")
+    b.button(text="ℹ️ Як це працює", callback_data="info")
+    b.adjust(1)
+    return b.as_markup()
 
-def ikb_dates():
-    kb = InlineKeyboardBuilder()
+def kb_dates():
+    b = InlineKeyboardBuilder()
     for d in SHOOT_DATES:
-        kb.button(text=d, callback_data=f"date:{d}")
-    kb.adjust(2)
-    return kb.as_markup()
+        b.button(text=d, callback_data=f"date:{d}")
+    b.adjust(2)
+    return b.as_markup()
 
-def ikb_times():
-    kb = InlineKeyboardBuilder()
-    for t in SHOOT_TIMES:
-        kb.button(text=t, callback_data=f"time:{t}")
-    kb.adjust(3)
-    return kb.as_markup()
+def kb_times():
+    b = InlineKeyboardBuilder()
+    for t in TIME_SLOTS:
+        b.button(text=t, callback_data=f"time:{t}")
+    b.button(text="⬅️ Назад до дат", callback_data="back:dates")
+    b.adjust(2)
+    return b.as_markup()
 
-def rb_next_only():
-    rb = ReplyKeyboardBuilder()
-    rb.button(text="ДАЛІ")
-    rb.adjust(1)
-    return rb.as_markup(resize_keyboard=True)
+def kb_skip_address():
+    b = InlineKeyboardBuilder()
+    b.button(text="ДАЛІ", callback_data="skip:address")
+    b.adjust(1)
+    return b.as_markup()
 
-def rb_submit_more():
-    rb = ReplyKeyboardBuilder()
-    rb.button(text="➕ Подати ще одну людину")
-    rb.button(text="✅ Готово")
-    rb.adjust(1)
-    return rb.as_markup(resize_keyboard=True)
+def kb_restart_end():
+    b = InlineKeyboardBuilder()
+    b.button(text="➕ Подати ще одну людину", callback_data="apply")
+    b.button(text="✅ Завершити", callback_data="done")
+    b.adjust(1)
+    return b.as_markup()
 
 
 # =========================
-# Aiogram setup
+# Bot texts (nice + Ukrainian)
 # =========================
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+WELCOME = (
+    "Привіт! 💛\n\n"
+    "Це бот для подачі заявки на зйомку.\n"
+    "Я зберу дані для модельного релізу та допоможу обрати день і час.\n\n"
+    "Натисніть кнопку нижче 👇"
+)
+
+INFO = (
+    "Як це працює 💡\n\n"
+    "1) Ви обираєте дату та час.\n"
+    "2) Заповнюєте дані англійською (як у документі).\n"
+    "3) Додаєте портретне фото.\n\n"
+    "Після подачі заявки менеджер опрацює списки ближче до дати зйомки.\n"
+    "Локацію та фінальні деталі ми надішлемо окремо ✅"
+)
+
+ASK_DATE = "Оберіть, будь ласка, дату зйомки 📅"
+ASK_TIME = "Чудово! Тепер оберіть час 🕒"
+ASK_NAME = (
+    "Дякую 💛\n"
+    "Тепер введіть, будь ласка, імʼя та прізвище **англійською**.\n"
+    "Приклад: Ivan Petrenko"
+)
+ASK_DOB = (
+    "Супер!\n"
+    "Тепер дата народження 🗓\n"
+    "Введіть у форматі: 17.05.1994"
+)
+ASK_PHONE = (
+    "Дякую!\n"
+    "Тепер номер телефону 📞\n"
+    "Введіть ТІЛЬКИ цифри у форматі: 380931111111"
+)
+ASK_EMAIL = (
+    "Чудово!\n"
+    "Тепер електронна пошта ✉️\n"
+    "Приклад: name@example.com"
+)
+ASK_COUNTRY = (
+    "Дякую 💛\n"
+    "Вкажіть, будь ласка, країну проживання **англійською**.\n"
+    "Приклад: Ukraine"
+)
+ASK_GUARDIAN = (
+    "Якщо заявка для дитини 👶 — вкажіть, будь ласка, імʼя та прізвище опікуна **англійською**.\n"
+    "Якщо опікун не потрібен — напишіть: None"
+)
+ASK_ADDRESS = (
+    "Тепер адреса проживання 🏡\n"
+    "Якщо вам комфортно — додайте адресу **англійською** (вулиця, будинок).\n"
+    "Якщо не хочете — це абсолютно ок 😊\n"
+    "Натисніть «ДАЛІ», і менеджер уточнить це питання пізніше."
+)
+ASK_CITY = (
+    "Дякую! 💛\n"
+    "Тепер місто проживання **англійською**.\n"
+    "Приклад: Kyiv"
+)
+ASK_PHOTO = (
+    "Майже готово ✨\n"
+    "Надішліть, будь ласка, портретне фото (селфі або портрет).\n"
+    "Без фільтрів — як вам комфортно 💛"
+)
+
+FINAL_TEXT = (
+    "Дякуємо! 💛 Ваша заявка успішно надіслана.\n\n"
+    "Менеджер опрацьовує списки ближче до дати зйомки.\n"
+    "Інформацію по локації та підтвердження ми надішлемо окремо ✅\n\n"
+    "Хочете подати ще одну людину?"
+)
+
+
+# =========================
+# Google Sheet write + name-duplicates
+# =========================
+
+def open_ws_for_date(gclient: gspread.Client, sheets_service, date_ddmmyyyy: str):
+    ensure_tab_and_headers(gclient, sheets_service, date_ddmmyyyy)
+    sh = gclient.open_by_key(GOOGLE_SHEET_ID)
+    return sh.worksheet(date_ddmmyyyy)
+
+def name_exists(ws: gspread.Worksheet, model_name: str) -> bool:
+    try:
+        # Find ModelName col index
+        col = HEADERS.index("ModelName") + 1
+        vals = ws.col_values(col)[1:]  # skip header
+        target = model_name.strip().lower()
+        return any(v.strip().lower() == target for v in vals if v)
+    except Exception:
+        return False
+
+def append_row(ws: gspread.Worksheet, row: list):
+    ws.append_row(row, value_input_option="USER_ENTERED")
+
+
+# =========================
+# Notifications loop (manager sets Status in sheet)
+# =========================
+
+async def notify_loop(bot: Bot):
+    """
+    Every minute checks all tabs:
+      - Status == approved/rejected
+      - NotifiedAt empty
+      - TelegramChatId present
+    Sends message and writes NotifiedAt.
+    """
+    await asyncio.sleep(5)  # small delay after startup
+    while True:
+        try:
+            gclient = get_gspread_client()
+            sheets_service = get_sheets_service()
+            sh = gclient.open_by_key(GOOGLE_SHEET_ID)
+
+            for tab in SHOOT_DATES:
+                try:
+                    ws = sh.worksheet(tab)
+                except Exception:
+                    continue
+
+                # pull all rows (could be optimized later)
+                rows = ws.get_all_values()
+                if not rows or rows[0] != HEADERS:
+                    continue
+
+                # indices
+                i_chat = HEADERS.index("TelegramChatId")
+                i_status = HEADERS.index("Status")
+                i_notif = HEADERS.index("NotifiedAt")
+                i_time = None
+                # time isn't a header, so we don't store time in a separate column; it lives in no header
+                # We'll include it in message from stored shoot date only (таб-дата).
+                # If you want time in sheet too later — we can add "ShootTime" column.
+
+                updates = []
+                for r_idx in range(1, len(rows)):
+                    r = rows[r_idx]
+                    # pad
+                    if len(r) < len(HEADERS):
+                        r += [""] * (len(HEADERS) - len(r))
+
+                    chat_id = r[i_chat].strip()
+                    status = r[i_status].strip().lower()
+                    notified = r[i_notif].strip()
+
+                    if not chat_id or notified:
+                        continue
+                    if status not in ("approved", "rejected"):
+                        continue
+
+                    # notify
+                    if status == "approved":
+                        text = (
+                            "Привіт! 💛\n\n"
+                            "Ваша заявка попередньо ПІДТВЕРДЖЕНА ✅\n"
+                            "Деталі по локації та часу ми надішлемо окремо трохи ближче до зйомки.\n\n"
+                            "Дякуємо!"
+                        )
+                    else:
+                        text = (
+                            "Привіт! 💛\n\n"
+                            "На жаль, цього разу ми не можемо вас підтвердити ❌\n"
+                            "Але будемо раді бачити вас на наступних зйомках.\n\n"
+                            "Дякуємо за заявку!"
+                        )
+
+                    try:
+                        await bot.send_message(chat_id=int(chat_id), text=text)
+                        # write NotifiedAt in sheet
+                        cell = gspread.utils.rowcol_to_a1(r_idx + 1, i_notif + 1)
+                        updates.append((cell, now_iso()))
+                    except Exception:
+                        # ignore send failures (user blocked bot etc.)
+                        pass
+
+                if updates:
+                    # batch update
+                    ws.update([[v] for _, v in updates], range_name=f"{gspread.utils.rowcol_to_a1(2, i_notif+1)}:{gspread.utils.rowcol_to_a1(2000, i_notif+1)}")
+                    # The above is a simple update; to be precise per-cell we do:
+                    for cell, value in updates:
+                        ws.update(cell, value)
+
+        except Exception:
+            pass
+
+        await asyncio.sleep(60)
 
 
 # =========================
 # Handlers
 # =========================
 
-@dp.message(CommandStart())
-async def start(m: Message):
-    reset_form(m.chat.id)
-    await m.answer(
-        "Привіт 💛\n"
-        "Я допоможу подати заявку на зйомку.\n\n"
-        "Натисніть кнопку нижче, щоб почати 👇",
-        reply_markup=kb_start()
-    )
+async def start_new_form(state: FSMContext):
+    await state.set_state(Form.pick_date)
+    await state.update_data(draft=Draft().__dict__)
 
-@dp.message(F.text == "📝 Подати заявку на зйомку")
-async def apply_start(m: Message):
-    reset_form(m.chat.id)
-    await m.answer(
-        "Супер 😊\n"
-        "Оберіть, будь ласка, дату зйомки (кожен день — окрема вкладка в таблиці):",
-        reply_markup=ikb_dates()
-    )
+def get_draft(data: dict) -> Draft:
+    d = data.get("draft", {})
+    return Draft(**d)
 
-@dp.callback_query(F.data.startswith("date:"))
-async def pick_date(cq: CallbackQuery):
-    d = cq.data.split(":", 1)[1]
-    FORM.setdefault(cq.message.chat.id, {})
-    FORM[cq.message.chat.id]["ShootDateHuman"] = d
-    await cq.message.answer(
-        f"Чудово! Дата: {d}\n\nТепер оберіть час:",
-        reply_markup=ikb_times()
-    )
-    await cq.answer()
+async def save_draft(state: FSMContext, draft: Draft):
+    await state.update_data(draft=draft.__dict__)
 
-@dp.callback_query(F.data.startswith("time:"))
-async def pick_time(cq: CallbackQuery):
-    t = cq.data.split(":", 1)[1]
-    FORM[cq.message.chat.id]["ShootTime"] = t
 
-    await cq.message.answer(
-        "Тепер ім’я та прізвище англійською (як у закордонному паспорті).\n"
-        "Приклад: Anastasiia Svitylko",
-        reply_markup=None
-    )
-    await cq.answer()
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(WELCOME, reply_markup=kb_start())
 
-@dp.message(F.text)
-async def text_router(m: Message):
-    chat_id = m.chat.id
-    if chat_id not in FORM:
-        reset_form(chat_id)
+async def cb_apply(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await start_new_form(state)
+    await call.message.answer(ASK_DATE, reply_markup=kb_dates())
 
-    data = FORM[chat_id]
-    text = (m.text or "").strip()
+async def cb_info(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await call.message.answer(INFO, reply_markup=kb_start())
 
-    # якщо ще не вибрали дату/час — ігноруємо
-    if not data.get("ShootDateHuman") or not data.get("ShootTime"):
+async def cb_done(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.clear()
+    await call.message.answer("Готово 💛 Якщо захочете — просто натисніть «Подати заявку» ще раз.", reply_markup=kb_start())
+
+async def cb_back_dates(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.set_state(Form.pick_date)
+    await call.message.answer(ASK_DATE, reply_markup=kb_dates())
+
+async def cb_pick_date(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    date_ddmmyyyy = call.data.split("date:", 1)[1]
+    data = await state.get_data()
+    draft = get_draft(data)
+    draft.shoot_date_ddmmyyyy = date_ddmmyyyy
+    await save_draft(state, draft)
+
+    await state.set_state(Form.pick_time)
+    await call.message.answer(f"Дата: {date_ddmmyyyy} ✅\n\n{ASK_TIME}", reply_markup=kb_times())
+
+async def cb_pick_time(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    t = call.data.split("time:", 1)[1]
+    data = await state.get_data()
+    draft = get_draft(data)
+    draft.shoot_time = t
+    await save_draft(state, draft)
+
+    await state.set_state(Form.model_name)
+    await call.message.answer(f"Час: {t} ✅\n\n{ASK_NAME}")
+
+async def on_name(message: Message, state: FSMContext):
+    name = (message.text or "").strip()
+    if not is_english_like(name):
+        await message.answer("Ой, схоже тут не англійською 🙈\nБудь ласка, введіть імʼя та прізвище англійською.\nПриклад: Ivan Petrenko")
         return
 
-    # 1) ModelName
-    if not data.get("ModelName"):
-        if not only_english(text):
-            await m.answer("Будь ласка, введіть ім’я та прізвище лише англійськими літерами 😊")
-            return
-        model_name = clean_spaces(text)
-        # дублікати по імені у вибраній вкладці-дні
-        if find_duplicate_name(data["ShootDateHuman"], model_name):
-            await m.answer(
-                "Здається, заявка з таким ім’ям у цей день уже є 🤍\n"
-                "Будь ласка, уточніть ім’я (наприклад додайте середній ініціал) і надішліть ще раз англійською."
-            )
-            return
-        data["ModelName"] = model_name
-        await m.answer(
-            "Дякую 💛\n\n"
-            "Дата народження 🗓\n"
-            "Введіть у форматі: день.місяць.рік\n"
-            "Приклад: 05.07.1996"
+    data = await state.get_data()
+    draft = get_draft(data)
+    draft.model_name = name
+    await save_draft(state, draft)
+
+    await state.set_state(Form.dob)
+    await message.answer(ASK_DOB)
+
+async def on_dob(message: Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    if not re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", txt):
+        await message.answer("Будь ласка, формат: 17.05.1994")
+        return
+    data = await state.get_data()
+    draft = get_draft(data)
+    draft.dob_ddmmyyyy = txt
+    await save_draft(state, draft)
+
+    await state.set_state(Form.phone)
+    await message.answer(ASK_PHONE)
+
+async def on_phone(message: Message, state: FSMContext):
+    txt = (message.text or "").strip().replace(" ", "")
+    if not PHONE_RE.match(txt):
+        await message.answer("Телефон має бути тільки цифри у форматі 380931111111. Спробуйте ще раз 💛")
+        return
+    data = await state.get_data()
+    draft = get_draft(data)
+    draft.phone = txt
+    await save_draft(state, draft)
+
+    await state.set_state(Form.email)
+    await message.answer(ASK_EMAIL)
+
+async def on_email(message: Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    if not EMAIL_RE.match(txt):
+        await message.answer("Здається, пошта написана з помилкою 🙈\nПриклад: name@example.com")
+        return
+    data = await state.get_data()
+    draft = get_draft(data)
+    draft.email = txt
+    await save_draft(state, draft)
+
+    await state.set_state(Form.country)
+    await message.answer(ASK_COUNTRY)
+
+async def on_country(message: Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    if not is_english_like(txt):
+        await message.answer("Будь ласка, напишіть країну англійською. Приклад: Ukraine")
+        return
+    data = await state.get_data()
+    draft = get_draft(data)
+    draft.country = txt
+    await save_draft(state, draft)
+
+    await state.set_state(Form.guardian)
+    await message.answer(ASK_GUARDIAN)
+
+async def on_guardian(message: Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    if txt.lower() != "none" and not is_english_like(txt):
+        await message.answer("Будь ласка, імʼя опікуна англійською або напишіть None")
+        return
+
+    data = await state.get_data()
+    draft = get_draft(data)
+    draft.guardian = txt
+    await save_draft(state, draft)
+
+    await state.set_state(Form.address)
+    await message.answer(ASK_ADDRESS, reply_markup=kb_skip_address())
+
+async def cb_skip_address(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    data = await state.get_data()
+    draft = get_draft(data)
+    draft.address = ""
+    draft.city = ""
+    await save_draft(state, draft)
+
+    # skip city/state/zip as requested
+    await state.set_state(Form.photo)
+    await call.message.answer(ASK_PHOTO)
+
+async def on_address(message: Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    # If user types "ДАЛІ" manually
+    if txt.upper() == "ДАЛІ":
+        data = await state.get_data()
+        draft = get_draft(data)
+        draft.address = ""
+        draft.city = ""
+        await save_draft(state, draft)
+        await state.set_state(Form.photo)
+        await message.answer(ASK_PHOTO)
+        return
+
+    if not is_english_like(txt):
+        await message.answer("Будь ласка, адреса англійською 😊\nАбо натисніть «ДАЛІ».", reply_markup=kb_skip_address())
+        return
+
+    data = await state.get_data()
+    draft = get_draft(data)
+    draft.address = txt
+    await save_draft(state, draft)
+
+    await state.set_state(Form.city)
+    await message.answer(ASK_CITY)
+
+async def on_city(message: Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    if not is_english_like(txt):
+        await message.answer("Будь ласка, місто англійською. Приклад: Kyiv")
+        return
+
+    data = await state.get_data()
+    draft = get_draft(data)
+    draft.city = txt
+    await save_draft(state, draft)
+
+    await state.set_state(Form.photo)
+    await message.answer(ASK_PHOTO)
+
+async def on_photo(message: Message, state: FSMContext, bot: Bot):
+    if not message.photo:
+        await message.answer("Потрібно саме фото 🙏 Надішліть портретним фото, будь ласка.")
+        return
+
+    data = await state.get_data()
+    draft = get_draft(data)
+
+    # Ensure tabs + headers
+    gclient = get_gspread_client()
+    sheets_service = get_sheets_service()
+    ws = open_ws_for_date(gclient, sheets_service, draft.shoot_date_ddmmyyyy)
+
+    # block duplicates by name
+    if name_exists(ws, draft.model_name):
+        await message.answer(
+            "Ой 🙈 Схоже, заявка з таким імʼям уже є в цей день.\n"
+            "Якщо це інша людина з таким самим імʼям — додайте, будь ласка, середню літеру або друге імʼя англійською.\n"
+            "Приклад: Ivan P. Petrenko\n\n"
+            "Введіть імʼя ще раз:"
         )
+        await state.set_state(Form.model_name)
         return
 
-    # 2) DateOfBirth
-    if not data.get("DateOfBirth"):
-        try:
-            dob_mmddyyyy = ua_date_to_mmddyyyy(text)
-        except Exception:
-            await m.answer("Трішки не той формат 🙏 Спробуйте так: 05.07.1996")
-            return
-        data["DateOfBirth"] = dob_mmddyyyy
-        await m.answer(
-            "Супер 😊\n\n"
-            "Номер телефону у форматі 380931111111 (без +, без пробілів):"
-        )
-        return
-
-    # 3) Phone
-    if not data.get("Phone"):
-        if not is_phone_ua(text):
-            await m.answer("Потрібен формат рівно так: 380931111111 🙏 Спробуйте ще раз.")
-            return
-        data["Phone"] = text
-        await m.answer(
-            "Електронна пошта ✉️\n"
-            "Приклад: name@example.com"
-        )
-        return
-
-    # 4) Email
-    if not data.get("Email"):
-        email = text.strip()
-        if "@" not in email or "." not in email:
-            await m.answer("Здається, email написаний з помилкою 😊 Спробуйте ще раз.")
-            return
-        data["Email"] = email
-        await m.answer(
-            "Адреса проживання 🏡\n"
-            "Якщо вам комфортно — додайте, будь ласка, адресу англійською (вулиця, будинок).\n"
-            "Якщо не хочете — це абсолютно ок 😊 менеджер зможе уточнити це пізніше.\n\n"
-            "Напишіть адресу англійською або натисніть ДАЛІ:",
-            reply_markup=rb_next_only()
-        )
-        return
-
-    # 5) ResidenceAddress (optional)
-    if data.get("ResidenceAddress") == "" and not data.get("City"):
-        # ми ще на кроці адреси
-        if text.upper() == "ДАЛІ":
-            data["SkipAddress"] = True
-            data["ResidenceAddress"] = ""
-            # якщо адреса пропущена — не питаємо місто/індекс (як ти просила)
-            data["City"] = ""
-            data["ZipCode"] = ""
-            await m.answer(
-                "Добре 💛\n\n"
-                "І ще одне питання: ім’я та прізвище опікуна (якщо модель неповнолітня).\n"
-                "Якщо повнолітня — напишіть: NONE"
-            )
-            return
-
-        if not only_english(text):
-            await m.answer("Адресу, будь ласка, англійською 😊 Або натисніть ДАЛІ.")
-            return
-        data["ResidenceAddress"] = clean_spaces(text)
-        # якщо адреса є — питаємо лише місто (як ти просила), без області
-        await m.answer(
-            "Дякую 💛\n\nМісто проживання англійською.\nПриклад: Kyiv"
-        )
-        return
-
-    # 6) City (тільки якщо адресу ввели)
-    if data.get("ResidenceAddress") and not data.get("City"):
-        if not only_english(text):
-            await m.answer("Місто, будь ласка, англійською 😊 Приклад: Kyiv")
-            return
-        data["City"] = clean_spaces(text)
-        await m.answer(
-            "Поштовий індекс (Zip Code) — якщо маєте.\n"
-            "Якщо не знаєте — напишіть: NONE"
-        )
-        return
-
-    # 7) ZipCode (тільки якщо адресу ввели)
-    if data.get("ResidenceAddress") and not data.get("ZipCode"):
-        z = text.strip()
-        if z.upper() == "NONE":
-            z = ""
-        data["ZipCode"] = z
-        await m.answer(
-            "Ім’я та прізвище опікуна (якщо модель неповнолітня).\n"
-            "Якщо повнолітня — напишіть: NONE"
-        )
-        return
-
-    # 8) GuardianName
-    if not data.get("GuardianName"):
-        g = clean_spaces(text)
-        if g.upper() == "NONE":
-            g = ""
-        else:
-            if not only_english(g):
-                await m.answer("Опікуна, будь ласка, англійською 😊 Або NONE")
-                return
-        data["GuardianName"] = g
-        await m.answer(
-            "Останній крок 📸\n"
-            "Надішліть, будь ласка, портретне фото (селфі або портрет), без фільтрів бажано 😊"
-        )
-        return
-
-    # якщо ми вже попросили фото — текст ігноруємо
-    return
-
-
-@dp.message(F.photo)
-async def got_photo(m: Message):
-    chat_id = m.chat.id
-    if chat_id not in FORM:
-        reset_form(chat_id)
-    data = FORM[chat_id]
-
-    if not data.get("GuardianName"):
-        await m.answer("Спочатку відповімо на питання вище 😊")
-        return
-
-    # беремо найбільший розмір фото
-    ph = m.photo[-1]
-    file = await bot.get_file(ph.file_id)
-    file_bytes = await bot.download_file(file.file_path)
-
-    # upload to Drive (optional)
-    drive_id = ""
+    # Upload photo
+    biggest = message.photo[-1]
+    file_id = biggest.file_id
+    safe_name = re.sub(r"[^A-Za-z0-9_]+", "_", draft.model_name).strip("_")
+    filename = f"{draft.shoot_date_ddmmyyyy}_{draft.shoot_time}_{safe_name}.jpg"
     try:
-        drive_id = upload_photo_to_drive(file_bytes.read(), f"{data['ModelName'].replace(' ', '_')}.jpg")
+        photo_ref = await upload_photo_to_drive(bot, file_id, filename)
     except Exception:
-        drive_id = ""
+        photo_ref = file_id  # fallback
 
-    data["PhotoDriveId"] = drive_id
+    # Build row
+    shoot_mmddyyyy = to_mmddyyyy(draft.shoot_date_ddmmyyyy)
+    dob_mmddyyyy = to_mmddyyyy(draft.dob_ddmmyyyy)
 
-    # готуємо рядок для Google Sheet
-    shoot_date_tab = data["ShootDateHuman"]
-    shoot_mmddyyyy = shootdate_to_mmddyyyy(shoot_date_tab)
+    # Residence fields: if address skipped, city/state/zip empty as requested
+    residence_address = draft.address
+    city = draft.city if draft.address else ""
+    state = ""  # residence state not asked in this flow
+    zipcode = ""  # zip not asked in this flow
 
-    row = {
-        "Nameprint": NAMEPRINT_CONST,
-        "DateSigned": shoot_mmddyyyy,       # як ти просила: DateSigned = ShootDate (день зйомки)
-        "ShootDate": shoot_mmddyyyy,
-        "ShootPlace": SHOOTPLACE_CONST,
-        "ShootState": SHOOTSTATE_CONST,
-        "ModelName": data["ModelName"],
-        "DateOfBirth": data["DateOfBirth"],  # уже у MM/DD/YYYY
-        "ResidenceAddress": data["ResidenceAddress"],
-        "City": data["City"],
-        "State": "",                         # ми не питаємо область
-        "Country": "Ukraine",
-        "ZipCode": data["ZipCode"],
-        "Phone": data["Phone"],
-        "Email": data["Email"],
-        "GuardianName": data["GuardianName"],
-        "DateSigneded": shoot_mmddyyyy,
-        "Photo": drive_id,                   # тут збережемо Drive fileId (або пусто)
-        "TelegramChatId": str(chat_id),
-        "Status": "",                        # менеджер поставить approved/rejected
-        "NotifiedAt": "",                    # бот заповнить коли повідомить
-    }
+    row = [
+        FIXED_NAMEPRINT, shoot_mmddyyyy, shoot_mmddyyyy, FIXED_SHOOTPLACE, FIXED_SHOOTSTATE,
+        draft.model_name, dob_mmddyyyy, residence_address, city, state, draft.country,
+        zipcode, draft.phone, draft.email, draft.guardian,
+        shoot_mmddyyyy, photo_ref,
+        str(message.chat.id), "pending", ""
+    ]
 
-    # гарантуємо вкладки + заголовки перед записом
-    ensure_all_tabs_and_headers()
-    append_row(shoot_date_tab, row)
+    append_row(ws, row)
 
-    await m.answer(
-        "Дякуємо! 💛 Ваша заявка успішно надіслана.\n\n"
-        "Менеджер опрацьовує списки ближче до дати зйомки.\n"
-        "Інформація по локації та деталях буде надіслана ближче до зйомки.\n"
-        "На майданчику вас зустріне адміністратор і підкаже все необхідне 😊\n\n"
-        "Хочете подати ще одну людину?",
-        reply_markup=rb_submit_more()
-    )
-
-    # підготувати форму на наступну людину (але не стартувати автоматом)
-    reset_form(chat_id)
-    # залишимо дату/час пустими, щоб вона знов натиснула "Подати заявку"
-
-
-@dp.message(F.text == "➕ Подати ще одну людину")
-async def submit_more(m: Message):
-    reset_form(m.chat.id)
-    await m.answer("Супер 😊 Оберіть дату зйомки:", reply_markup=ikb_dates())
-
-@dp.message(F.text == "✅ Готово")
-async def done(m: Message):
-    reset_form(m.chat.id)
-    await m.answer("Домовились 💛 Гарного дня!", reply_markup=kb_start())
+    await state.clear()
+    await message.answer(FINAL_TEXT, reply_markup=kb_restart_end())
 
 
 # =========================
-# Status polling (менеджер ставить Status у таблиці)
-# =========================
-
-async def poll_status_changes():
-    await asyncio.sleep(3)
-    while True:
-        try:
-            ensure_all_tabs_and_headers()
-
-            for tab in SHOOT_DATES:
-                ws = sheets_doc.worksheet(tab)
-
-                col_status = get_col(ws, "Status")
-                col_notified = get_col(ws, "NotifiedAt")
-                col_chat = get_col(ws, "TelegramChatId")
-
-                if not col_status or not col_notified or not col_chat:
-                    continue
-
-                statuses = ws.col_values(col_status)[1:]
-                notified = ws.col_values(col_notified)[1:]
-                chats = ws.col_values(col_chat)[1:]
-
-                # рядки в таблиці починаються з 2 (бо 1 — заголовок)
-                for i, status in enumerate(statuses, start=2):
-                    st = (status or "").strip().lower()
-                    if st not in (STATUS_APPROVED, STATUS_REJECTED):
-                        continue
-
-                    already = (notified[i - 2] or "").strip()
-                    if already:
-                        continue
-
-                    chat_id_str = (chats[i - 2] or "").strip()
-                    if not chat_id_str.isdigit():
-                        set_cell(ws, i, "NotifiedAt", now_iso())
-                        continue
-
-                    chat_id = int(chat_id_str)
-
-                    if st == STATUS_APPROVED:
-                        text = (
-                            "Є хороші новини 💛\n"
-                            "Ваша заявка погоджена ✅\n\n"
-                            "Локацію та деталі менеджер надішле ближче до зйомки."
-                        )
-                    else:
-                        text = (
-                            "Дякуємо за заявку 💛\n"
-                            "На жаль, цього разу не виходить ❌\n\n"
-                            "Будемо раді бачити вас у наступних зйомках 😊"
-                        )
-
-                    try:
-                        await bot.send_message(chat_id, text)
-                    except Exception:
-                        pass
-
-                    set_cell(ws, i, "NotifiedAt", now_iso())
-
-        except Exception:
-            # не валимо бота через тимчасові помилки API
-            pass
-
-        await asyncio.sleep(POLL_SECONDS)
-
-
-# =========================
-# MAIN
+# Main
 # =========================
 
 async def main():
-    # 1) на старті створюємо вкладки і заголовки (з новими колонками)
-    ensure_all_tabs_and_headers()
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is empty (set Railway Variable BOT_TOKEN)")
+    if not GOOGLE_SHEET_ID:
+        raise RuntimeError("GOOGLE_SHEET_ID is empty (set Railway Variable GOOGLE_SHEET_ID)")
 
-    # 2) запускаємо фон-перевірку статусів
-    asyncio.create_task(poll_status_changes())
+    # Create tabs once on startup (safe)
+    try:
+        ensure_all_tabs_once()
+    except Exception:
+        pass
 
-    # 3) стартуємо бота
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher(storage=MemoryStorage())
+
+    dp.message.register(cmd_start, CommandStart())
+    dp.callback_query.register(cb_apply, F.data == "apply")
+    dp.callback_query.register(cb_info, F.data == "info")
+    dp.callback_query.register(cb_done, F.data == "done")
+    dp.callback_query.register(cb_back_dates, F.data == "back:dates")
+    dp.callback_query.register(cb_pick_date, F.data.startswith("date:"))
+    dp.callback_query.register(cb_pick_time, F.data.startswith("time:"))
+    dp.callback_query.register(cb_skip_address, F.data == "skip:address")
+
+    dp.message.register(on_name, Form.model_name)
+    dp.message.register(on_dob, Form.dob)
+    dp.message.register(on_phone, Form.phone)
+    dp.message.register(on_email, Form.email)
+    dp.message.register(on_country, Form.country)
+    dp.message.register(on_guardian, Form.guardian)
+    dp.message.register(on_address, Form.address)
+    dp.message.register(on_city, Form.city)
+    dp.message.register(lambda m, s: on_photo(m, s, bot), Form.photo)
+
+    # Notifications background
+    asyncio.create_task(notify_loop(bot))
+
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
