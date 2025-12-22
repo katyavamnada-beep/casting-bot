@@ -1,7 +1,5 @@
 import os
 import re
-import json
-import base64
 import asyncio
 from datetime import datetime, timezone
 
@@ -17,6 +15,11 @@ from aiogram.fsm.storage.memory import MemoryStorage
 import gspread
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaInMemoryUpload
+from google.oauth2.credentials import Credentials as UserCredentials
+from google.auth.transport.requests import Request
+
 
 # =====================
 # ENV
@@ -24,12 +27,12 @@ from google.oauth2.service_account import Credentials as ServiceAccountCredentia
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")  # папка для фото (може бути пустою, якщо не треба)
+DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 SA_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "service_account.json")
 
-# Railway / secrets base64 (не обов'язково локально, але корисно на хостингу)
-SERVICE_ACCOUNT_JSON_B64 = os.getenv("SERVICE_ACCOUNT_JSON_B64", "")
-TOKEN_DRIVE_JSON_B64 = os.getenv("TOKEN_DRIVE_JSON_B64", "")  # якщо використовуєш token_drive.json
+# Optional: якщо хочеш обмежити нотифікації (можна лишити порожнім)
+# Наприклад: MANAGER_STATUS_POLL_SEC=60
+MANAGER_STATUS_POLL_SEC = int(os.getenv("MANAGER_STATUS_POLL_SEC", "60"))
 
 
 # =====================
@@ -52,8 +55,8 @@ SHOOTPLACE_CONST = "Ukraine"
 SHOOTSTATE_CONST = "Kyiv"
 COUNTRY_CONST = "Ukraine"
 
-# Базові колонки (як у тебе)
-BASE_HEADER = [
+# Базові колонки для релізів + менеджерські
+HEADER_BASE = [
     "Nameprint",
     "DateSigned",
     "ShootDate",
@@ -73,18 +76,16 @@ BASE_HEADER = [
     "Photo",
 ]
 
-# Менеджерські колонки (додаємо кодом)
-MANAGER_HEADER = ["TelegramChatId", "Status", "NotifiedAt"]
+# ДОДАЛИ: час, chat id, статус, коли повідомили
+# (час важливий для формування груп)
+HEADER_EXTRA = [
+    "ShootTime",
+    "TelegramChatId",
+    "Status",
+    "NotifiedAt",
+]
 
-# Повний заголовок
-HEADER = BASE_HEADER + MANAGER_HEADER
-
-STATUS_PENDING = "pending"
-STATUS_APPROVED = "approved"
-STATUS_REJECTED = "rejected"
-
-# Як часто бот перевіряє таблицю на статуси (сек)
-STATUS_POLL_SECONDS = 30
+HEADER = HEADER_BASE + HEADER_EXTRA
 
 
 # =====================
@@ -112,16 +113,15 @@ UA_FINISH = (
 )
 
 UA_APPROVED = (
-    "Є новини 💛\n\n"
-    "Ваша заявка Погоджена ✅\n"
-    "Деталі по локації та організації ми надішлемо ближче до зйомки.\n"
-    "Якщо потрібно щось уточнити — менеджер з вами звʼяжеться."
+    "Є хороші новини 💛\n"
+    "Вас погоджено на зйомку ✅\n\n"
+    "Деталі по локації та таймінгу надішлемо ближче до дати зйомки."
 )
 
 UA_REJECTED = (
-    "Дякуємо 💛\n\n"
-    "Цього разу, на жаль, не виходить ❌\n"
-    "Але ми збережемо контакт — можемо написати вам щодо наступних зйомок."
+    "Дякуємо вам за заявку 💛\n"
+    "На жаль, цього разу не вийшло погодити участь.\n\n"
+    "Будемо раді бачити вас у наступних кастингах 😊"
 )
 
 
@@ -131,6 +131,7 @@ UA_REJECTED = (
 EN_TEXT_RE = re.compile(r"^[A-Za-z0-9\s\-\.'\,/#]+$")
 PHONE_RE = re.compile(r"^380\d{9}$")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+ZIP_RE = re.compile(r"^\d{4,10}$")
 
 def is_en(s: str) -> bool:
     s = s.strip()
@@ -141,6 +142,9 @@ def is_phone(s: str) -> bool:
 
 def is_email(s: str) -> bool:
     return bool(EMAIL_RE.fullmatch(s.strip()))
+
+def is_zip(s: str) -> bool:
+    return bool(ZIP_RE.fullmatch(s.strip()))
 
 def is_next_ua(s: str) -> bool:
     s = s.strip().lower()
@@ -154,11 +158,8 @@ def ddmmyyyy_to_mmddyyyy(ddmmyyyy: str) -> str:
     return f"{m}/{d}/{y}"
 
 def mmddyyyy_tab_name(mmddyyyy: str) -> str:
-    # Таб-нейм в тебе уже був у різних форматах.
-    # Тут робимо таб як дата у форматі: 10.01.2026 (як тобі зручно по дням)
-    # Але самі значення в колонках DateSigned/ShootDate — MM/DD/YYYY (як ти просила).
-    # Тобто: таб = dd.mm.yyyy, а в клітинках = mm/dd/yyyy
-    return None  # не використовується
+    # Таб-нейм робимо без "/" щоб Sheets API не плутав
+    return mmddyyyy.replace("/", "-")
 
 def is_dob_ua(text: str) -> bool:
     return bool(re.fullmatch(r"\d{2}[./]\d{2}[./]\d{4}", text.strip()))
@@ -171,8 +172,8 @@ def dob_ua_to_mmddyyyy(text: str) -> str:
 def missing_required(data: dict, keys: list[str]) -> bool:
     return any(k not in data or data.get(k) is None for k in keys)
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+def now_iso_utc() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 # =====================
@@ -241,96 +242,11 @@ class Form(StatesGroup):
 
 
 # =====================
-# GOOGLE (Sheets)
+# GOOGLE AUTH
 # =====================
-def ensure_local_secrets_if_needed():
-    """
-    На Railway файлів може не бути (бо ми їх не пушили).
-    Тому якщо немає service_account.json / token_drive.json — пробуємо відновити з BASE64 env.
-    """
-    if (not os.path.exists(SA_JSON)) and SERVICE_ACCOUNT_JSON_B64.strip():
-        raw = base64.b64decode(SERVICE_ACCOUNT_JSON_B64.strip().encode("utf-8"))
-        with open(SA_JSON, "wb") as f:
-            f.write(raw)
-
-    if (not os.path.exists("token_drive.json")) and TOKEN_DRIVE_JSON_B64.strip():
-        raw = base64.b64decode(TOKEN_DRIVE_JSON_B64.strip().encode("utf-8"))
-        with open("token_drive.json", "wb") as f:
-            f.write(raw)
-
 def sheets_service_creds():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     return ServiceAccountCredentials.from_service_account_file(SA_JSON, scopes=scopes)
-
-def open_sheet(gc: gspread.Client):
-    return gc.open_by_key(SHEET_ID)
-
-def ensure_day_tab_and_headers(sh, day_ddmmyyyy: str):
-    """
-    Кожен день = окрема вкладка з назвою як у кнопці: 10.01.2026
-    Додає заголовок HEADER, якщо треба, і доганяє менеджерські колонки.
-    """
-    try:
-        ws = sh.worksheet(day_ddmmyyyy)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=day_ddmmyyyy, rows=1000, cols=60)
-        ws.append_row(HEADER)
-        return ws
-
-    # Якщо вкладка є — перевіримо заголовок
-    try:
-        existing = ws.row_values(1)
-    except Exception:
-        existing = []
-
-    if not existing:
-        ws.append_row(HEADER)
-        return ws
-
-    # Якщо старий заголовок без менеджерських колонок — дозапишемо їх в кінець
-    need_append = []
-    for col in HEADER:
-        if col not in existing:
-            need_append.append(col)
-
-    if need_append:
-        # Додаємо відсутні заголовки в кінець
-        ws.update(f"{gspread.utils.rowcol_to_a1(1, len(existing)+1)}:{gspread.utils.rowcol_to_a1(1, len(existing)+len(need_append))}",
-                  [need_append])
-
-    return ws
-
-def find_col_index(headers: list[str], col_name: str) -> int:
-    # 1-based index
-    for i, v in enumerate(headers, start=1):
-        if v.strip() == col_name:
-            return i
-    return -1
-
-def model_exists_in_tab(ws, model_name: str) -> bool:
-    # ModelName = 6 колонка в BASE_HEADER, але краще знайдемо по заголовку
-    headers = ws.row_values(1)
-    idx = find_col_index(headers, "ModelName")
-    if idx < 1:
-        return False
-    col = ws.col_values(idx)
-    key = normalize_name_key(model_name)
-    for v in col[1:]:
-        if v and normalize_name_key(v) == key:
-            return True
-    return False
-
-
-# =====================
-# DRIVE UPLOAD (опційно)
-# =====================
-# Якщо у тебе фото вже нормально заливається в Drive у твоїй робочій версії — залишаємо як є:
-# тут ми не міняємо твою логіку, тільки не падаємо якщо DRIVE_FOLDER_ID не заданий.
-
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaInMemoryUpload
-from google.oauth2.credentials import Credentials as UserCredentials
-from google.auth.transport.requests import Request
 
 def drive_user_creds():
     scopes = ["https://www.googleapis.com/auth/drive.file"]
@@ -341,6 +257,63 @@ def drive_user_creds():
             f.write(creds.to_json())
     return creds
 
+def ensure_headers(ws):
+    """
+    Якщо вкладка вже існує, але в ній старі заголовки —
+    ми акуратно допишемо нові колонки (ShootTime, TelegramChatId, Status, NotifiedAt).
+    """
+    try:
+        existing = ws.row_values(1)
+    except Exception:
+        existing = []
+
+    if not existing:
+        ws.append_row(HEADER)
+        return
+
+    missing = [h for h in HEADER if h not in existing]
+    if missing:
+        # Додаємо в кінець заголовків
+        new_header = existing + missing
+        ws.update("A1", [new_header])
+
+def ensure_sheet_tab(gc: gspread.Client, sheet_id: str, shoot_date_mmddyyyy: str):
+    sh = gc.open_by_key(sheet_id)
+    tab = mmddyyyy_tab_name(shoot_date_mmddyyyy)
+    try:
+        ws = sh.worksheet(tab)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=tab, rows=1000, cols=60)
+        ws.append_row(HEADER)
+        return ws
+
+    ensure_headers(ws)
+    return ws
+
+def model_exists_in_tab(ws, model_name: str) -> bool:
+    """
+    Перевіряємо повні збіги імен у вкладці дня.
+    ModelName — це 6-та колонка в нашій логіці, але ми шукаємо по заголовку для надійності.
+    """
+    try:
+        header = ws.row_values(1)
+        if "ModelName" not in header:
+            return False
+        idx = header.index("ModelName") + 1
+        col = ws.col_values(idx)
+    except Exception:
+        return False
+
+    key = normalize_name_key(model_name)
+    for v in col[1:]:
+        if v and normalize_name_key(v) == key:
+            return True
+    return False
+
+
+# =====================
+# DRIVE UPLOAD
+# =====================
 def normalize_filename(shoot_date_ddmmyyyy: str, shoot_time: str, model_name: str, phone: str) -> str:
     safe_name = re.sub(r"[^A-Za-z0-9]+", "_", model_name.strip()).strip("_")
     safe_phone = re.sub(r"[^0-9]+", "", phone.strip())
@@ -349,11 +322,6 @@ def normalize_filename(shoot_date_ddmmyyyy: str, shoot_time: str, model_name: st
     return f"{safe_date}_{safe_time}_{safe_name}_{safe_phone}.jpg"
 
 async def upload_photo_to_drive(bot: Bot, file_id: str, filename: str) -> str:
-    if not DRIVE_FOLDER_ID:
-        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is empty")
-    if not os.path.exists("token_drive.json"):
-        raise RuntimeError("token_drive.json not found")
-
     creds = drive_user_creds()
     drive = build("drive", "v3", credentials=creds)
 
@@ -373,7 +341,89 @@ async def upload_photo_to_drive(bot: Bot, file_id: str, filename: str) -> str:
 
 
 # =====================
-# HANDLERS (старий UX)
+# MANAGER STATUS → NOTIFY USERS
+# =====================
+def normalize_status(s: str) -> str:
+    return (s or "").strip().lower()
+
+def status_to_message(status: str) -> str | None:
+    s = normalize_status(status)
+    if s in {"approved", "approve", "ok", "yes", "погоджено", "погоджена", "погоджений"}:
+        return UA_APPROVED
+    if s in {"rejected", "reject", "no", "відхилено", "не погоджено"}:
+        return UA_REJECTED
+    return None
+
+async def manager_status_loop(bot: Bot):
+    """
+    Раз на MANAGER_STATUS_POLL_SEC секунд:
+    - проходиться по всіх вкладках (днях)
+    - шукає рядки, де Status = approved/rejected
+    - якщо NotifiedAt порожнє — надсилає повідомлення і записує NotifiedAt
+    """
+    await asyncio.sleep(5)  # маленька пауза після старту
+    while True:
+        try:
+            gc = gspread.authorize(sheets_service_creds())
+            sh = gc.open_by_key(SHEET_ID)
+
+            for ws in sh.worksheets():
+                try:
+                    header = ws.row_values(1)
+                    if not header:
+                        continue
+                    if "Status" not in header or "TelegramChatId" not in header or "NotifiedAt" not in header:
+                        continue
+
+                    status_i = header.index("Status") + 1
+                    chat_i = header.index("TelegramChatId") + 1
+                    notified_i = header.index("NotifiedAt") + 1
+
+                    # Беремо всі рядки одним махом
+                    values = ws.get_all_values()
+                    if len(values) <= 1:
+                        continue
+
+                    for r in range(2, len(values) + 1):
+                        row = values[r - 1]
+                        status_val = row[status_i - 1] if status_i - 1 < len(row) else ""
+                        chat_val = row[chat_i - 1] if chat_i - 1 < len(row) else ""
+                        notified_val = row[notified_i - 1] if notified_i - 1 < len(row) else ""
+
+                        msg = status_to_message(status_val)
+                        if not msg:
+                            continue
+                        if notified_val.strip():
+                            continue
+                        if not chat_val.strip():
+                            continue
+
+                        try:
+                            chat_id = int(chat_val.strip())
+                        except Exception:
+                            continue
+
+                        # Надсилаємо повідомлення
+                        try:
+                            await bot.send_message(chat_id, msg)
+                        except Exception:
+                            # Якщо не можемо написати (людина заблокувала бота) — просто пропускаємо
+                            continue
+
+                        # Пишемо час нотифікації
+                        ws.update_cell(r, notified_i, now_iso_utc())
+
+                except Exception:
+                    continue
+
+        except Exception:
+            pass
+
+        await asyncio.sleep(MANAGER_STATUS_POLL_SEC)
+
+
+# =====================
+# HANDLERS
 # =====================
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -411,13 +461,11 @@ async def on_model_name(message: Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    shoot_date_ddmmyyyy = data.get("shoot_date")
+    shoot_date_mmddyyyy = ddmmyyyy_to_mmddyyyy(data["shoot_date"])
 
-    # Перевірка дубля по імені в табі цього дня
     try:
         gc = gspread.authorize(sheets_service_creds())
-        sh = open_sheet(gc)
-        ws = ensure_day_tab_and_headers(sh, shoot_date_ddmmyyyy)
+        ws = ensure_sheet_tab(gc, SHEET_ID, shoot_date_mmddyyyy)
         if model_exists_in_tab(ws, text):
             await message.answer(
                 "Схоже, така людина вже подана на цю дату 🙂\n"
@@ -456,7 +504,7 @@ async def on_dob(message: Message, state: FSMContext):
 async def on_residence_address(message: Message, state: FSMContext):
     text = message.text.strip()
 
-    # Якщо ДАЛІ — пропускаємо адресу + місто (як ти хотіла)
+    # Якщо людина пише ДАЛІ — пропускаємо адресу + місто
     if is_next_ua(text):
         await state.update_data(residence_address="", city="")
         await message.answer(
@@ -561,7 +609,7 @@ async def on_photo(message: Message, state: FSMContext, bot: Bot):
         drive_url = await upload_photo_to_drive(bot, file_id, filename)
     except Exception as e:
         await message.answer(
-            "Не вдалося завантажити фото 😔\n"
+            "Не вдалося завантажити фото в Google Drive 😔\n"
             "Спробуйте ще раз або напишіть адміну.\n\n"
             f"Технічна помилка: {type(e).__name__}"
         )
@@ -580,25 +628,20 @@ async def on_consent(call: CallbackQuery, state: FSMContext):
     await call.answer()
     data = await state.get_data()
 
-    required = ["shoot_date", "model_name", "dob", "phone", "email", "photo_drive_url"]
+    required = ["shoot_date", "shoot_time", "model_name", "dob", "phone", "email", "photo_drive_url"]
     if missing_required(data, required):
         await call.message.answer("Форма не активна 🙈 Почнемо спочатку: /start")
         await state.clear()
         return
 
-    shoot_date_ddmmyyyy = data["shoot_date"]
-    shoot_date_mmddyyyy = ddmmyyyy_to_mmddyyyy(shoot_date_ddmmyyyy)
-
+    shoot_date_mmddyyyy = ddmmyyyy_to_mmddyyyy(data["shoot_date"])
     guardian = (data.get("guardian_name") or "").strip()
     city_val = (data.get("city") or "").strip()
-    address_val = (data.get("residence_address") or "").strip()
 
-    # Пишемо в sheet
     gc = gspread.authorize(sheets_service_creds())
-    sh = open_sheet(gc)
-    ws = ensure_day_tab_and_headers(sh, shoot_date_ddmmyyyy)
+    ws = ensure_sheet_tab(gc, SHEET_ID, shoot_date_mmddyyyy)
 
-    # Дубль ще раз перед записом
+    # Дублі по імені
     if model_exists_in_tab(ws, data["model_name"]):
         await call.message.answer(
             "Схоже, ця людина вже є у списку на цю дату 🙂\n"
@@ -609,32 +652,66 @@ async def on_consent(call: CallbackQuery, state: FSMContext):
         await state.clear()
         return
 
-    chat_id = str(call.message.chat.id)
+    chat_id = call.from_user.id
 
     row = [
-        NAMEPRINT_CONST,             # Nameprint
-        shoot_date_mmddyyyy,         # DateSigned = день зйомки
-        shoot_date_mmddyyyy,         # ShootDate = день зйомки
-        SHOOTPLACE_CONST,            # ShootPlace
-        SHOOTSTATE_CONST,            # ShootState
-        data["model_name"].strip(),  # ModelName
-        data["dob"].strip(),         # DateOfBirth
-        address_val,                 # ResidenceAddress
-        city_val,                    # City
-        "",                          # State (не питаємо)
-        COUNTRY_CONST,               # Country (константа)
-        "",                          # ZipCode (не питаємо)
-        data["phone"].strip(),       # Phone
-        data["email"].strip(),       # Email
-        guardian,                    # GuardianName
-        shoot_date_mmddyyyy,         # DateSigneded (як було)
-        data["photo_drive_url"].strip(),  # Photo (url)
-        chat_id,                     # TelegramChatId
-        STATUS_PENDING,              # Status
-        "",                          # NotifiedAt
+        NAMEPRINT_CONST,                 # Nameprint
+        shoot_date_mmddyyyy,             # DateSigned
+        shoot_date_mmddyyyy,             # ShootDate
+        SHOOTPLACE_CONST,                # ShootPlace
+        SHOOTSTATE_CONST,                # ShootState
+        data["model_name"].strip(),      # ModelName
+        data["dob"].strip(),             # DateOfBirth
+        (data.get("residence_address") or "").strip(),  # ResidenceAddress
+        city_val,                        # City
+        "",                              # State
+        COUNTRY_CONST,                   # Country
+        "",                              # ZipCode
+        data["phone"].strip(),           # Phone
+        data["email"].strip(),           # Email
+        guardian,                        # GuardianName
+        shoot_date_mmddyyyy,             # DateSigneded
+        data["photo_drive_url"].strip(), # Photo
+        data["shoot_time"].strip(),      # ShootTime  ✅ ДОДАЛИ
+        str(chat_id),                    # TelegramChatId
+        "",                              # Status (менеджер поставить Approved/Rejected)
+        "",                              # NotifiedAt (бот заповнить коли повідомить)
     ]
 
-    ws.append_row(row)
+    # Якщо вкладка має старий header — ensure_headers вже додав колонки, але на всяк:
+    ensure_headers(ws)
+
+    # Якщо у вкладці вже інший порядок заголовків — підлаштуємо append по їх header
+    header_now = ws.row_values(1)
+    if header_now and header_now != HEADER:
+        # мапимо значення за назвою колонки
+        value_map = {
+            "Nameprint": NAMEPRINT_CONST,
+            "DateSigned": shoot_date_mmddyyyy,
+            "ShootDate": shoot_date_mmddyyyy,
+            "ShootPlace": SHOOTPLACE_CONST,
+            "ShootState": SHOOTSTATE_CONST,
+            "ModelName": data["model_name"].strip(),
+            "DateOfBirth": data["dob"].strip(),
+            "ResidenceAddress": (data.get("residence_address") or "").strip(),
+            "City": city_val,
+            "State": "",
+            "Country": COUNTRY_CONST,
+            "ZipCode": "",
+            "Phone": data["phone"].strip(),
+            "Email": data["email"].strip(),
+            "GuardianName": guardian,
+            "DateSigneded": shoot_date_mmddyyyy,
+            "Photo": data["photo_drive_url"].strip(),
+            "ShootTime": data["shoot_time"].strip(),
+            "TelegramChatId": str(chat_id),
+            "Status": "",
+            "NotifiedAt": "",
+        }
+        aligned = [value_map.get(h, "") for h in header_now]
+        ws.append_row(aligned)
+    else:
+        ws.append_row(row)
 
     await call.message.answer(UA_FINISH, reply_markup=kb_more())
     await state.clear()
@@ -653,111 +730,24 @@ async def on_more(call: CallbackQuery, state: FSMContext):
 
 
 # =====================
-# MANAGER STATUS WATCHER
-# =====================
-async def status_watcher(bot: Bot):
-    """
-    Менеджер у таблиці міняє Status на approved / rejected.
-    Бот знаходить рядки, де:
-      - Status in {approved, rejected}
-      - NotifiedAt пусто
-      - TelegramChatId не пусто
-    і надсилає повідомлення, потім ставить NotifiedAt.
-    """
-    while True:
-        try:
-            gc = gspread.authorize(sheets_service_creds())
-            sh = open_sheet(gc)
-
-            for day in DATES:
-                try:
-                    ws = sh.worksheet(day)
-                except gspread.WorksheetNotFound:
-                    continue
-
-                headers = ws.row_values(1)
-                if not headers:
-                    continue
-
-                idx_chat = find_col_index(headers, "TelegramChatId")
-                idx_status = find_col_index(headers, "Status")
-                idx_notif = find_col_index(headers, "NotifiedAt")
-
-                if idx_chat < 1 or idx_status < 1 or idx_notif < 1:
-                    # Якщо вкладка стара — доганяємо заголовки
-                    ws = ensure_day_tab_and_headers(sh, day)
-                    headers = ws.row_values(1)
-                    idx_chat = find_col_index(headers, "TelegramChatId")
-                    idx_status = find_col_index(headers, "Status")
-                    idx_notif = find_col_index(headers, "NotifiedAt")
-                    if idx_chat < 1 or idx_status < 1 or idx_notif < 1:
-                        continue
-
-                # Беремо всі значення (обережно, але у тебе там не мільйони рядків)
-                values = ws.get_all_values()
-                if len(values) < 2:
-                    continue
-
-                for r_i in range(2, len(values) + 1):  # 1-based rows, start from row 2
-                    row = values[r_i - 1]
-                    def get_cell(ci: int) -> str:
-                        return row[ci - 1].strip() if ci - 1 < len(row) and row[ci - 1] else ""
-
-                    chat_id = get_cell(idx_chat)
-                    status = get_cell(idx_status).lower()
-                    notified = get_cell(idx_notif)
-
-                    if not chat_id:
-                        continue
-                    if notified:
-                        continue
-                    if status not in {STATUS_APPROVED, STATUS_REJECTED}:
-                        continue
-
-                    # Надіслати повідомлення
-                    try:
-                        if status == STATUS_APPROVED:
-                            await bot.send_message(int(chat_id), UA_APPROVED)
-                        else:
-                            await bot.send_message(int(chat_id), UA_REJECTED)
-
-                        # Поставити NotifiedAt
-                        ws.update_cell(r_i, idx_notif, utc_now_iso())
-                    except Exception:
-                        # якщо не змогли написати (юзер заблокував бота тощо) — не валимо цикл
-                        pass
-
-        except Exception:
-            pass
-
-        await asyncio.sleep(STATUS_POLL_SECONDS)
-
-
-# =====================
 # MAIN
 # =====================
 async def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is empty")
+        raise RuntimeError("BOT_TOKEN is empty in .env")
     if not SHEET_ID:
-        raise RuntimeError("GOOGLE_SHEET_ID is empty")
-
-    # Секрети (Railway)
-    ensure_local_secrets_if_needed()
-
-    if not os.path.exists(SA_JSON):
-        raise RuntimeError("service_account.json not found (provide SERVICE_ACCOUNT_JSON_B64 or a file)")
-    # token_drive.json потрібен тільки якщо ти реально заливаєш фото в Drive
-    # Якщо хочеш — можна тимчасово вимкнути upload і все одно збирати анкети.
-    # Але у твоєму сценарії фото треба, тому залишаю як вимогу:
+        raise RuntimeError("GOOGLE_SHEET_ID is empty in .env")
     if not DRIVE_FOLDER_ID:
-        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is empty")
+        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is empty in .env")
+    if not os.path.exists("service_account.json"):
+        raise RuntimeError("service_account.json not found in project folder")
     if not os.path.exists("token_drive.json"):
-        raise RuntimeError("token_drive.json not found (provide TOKEN_DRIVE_JSON_B64 or upload file)")
+        raise RuntimeError("token_drive.json not found (run python3 auth_drive.py)")
 
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
 
+    # User flow
     dp.message.register(cmd_start, CommandStart())
     dp.callback_query.register(on_begin, F.data == "begin:yes")
 
@@ -781,8 +771,8 @@ async def main():
 
     dp.callback_query.register(on_more, F.data.startswith("more:"))
 
-    # Фоновий таск для статусів
-    asyncio.create_task(status_watcher(bot))
+    # Manager loop (status → notify)
+    asyncio.create_task(manager_status_loop(bot))
 
     await dp.start_polling(bot)
 
