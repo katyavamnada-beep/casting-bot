@@ -1,39 +1,27 @@
 import os
 import re
+import io
 import asyncio
+import datetime as dt
+from typing import Dict, Any, Optional, List
 
-from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.fsm.state import StatesGroup, State
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.filters import CommandStart
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 import gspread
-from google.oauth2.service_account import Credentials as ServiceAccountCredentials
-
+from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaInMemoryUpload
-from google.oauth2.credentials import Credentials as UserCredentials
-from google.auth.transport.requests import Request
+from googleapiclient.http import MediaIoBaseUpload
 
 
-# =====================
-# ENV
-# =====================
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
-SA_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "service_account.json")
+# =========================
+# CONFIG (редагуй тут, якщо треба)
+# =========================
 
-
-# =====================
-# CONFIG
-# =====================
-DATES = [
+# Дні зйомок (вкладки у Google Sheet) — як ти просила: "10.01.2026" тощо
+SHOOT_DATES = [
     "10.01.2026",
     "11.01.2026",
     "13.01.2026",
@@ -43,550 +31,598 @@ DATES = [
     "20.01.2026",
     "21.01.2026",
 ]
-TIMES = ["10:20", "11:00", "11:40", "12:30", "13:20"]
 
+# Тайм-слоти
+SHOOT_TIMES = ["10:20", "11:00", "11:40", "12:30", "13:20"]
+
+# Константи для релізів
 NAMEPRINT_CONST = "Stanislav Maspanov"
 SHOOTPLACE_CONST = "Ukraine"
 SHOOTSTATE_CONST = "Kyiv"
-COUNTRY_CONST = "Ukraine"
 
-HEADER = [
-    "Nameprint",
-    "DateSigned",
-    "ShootDate",
-    "ShootPlace",
-    "ShootState",
-    "ModelName",
-    "DateOfBirth",
-    "ResidenceAddress",
-    "City",
-    "State",
-    "Country",
-    "ZipCode",
-    "Phone",
-    "Email",
-    "GuardianName",
-    "DateSigneded",
-    "Photo",
+# Статуси, які менеджер може виставляти в таблиці
+STATUS_APPROVED = "approved"
+STATUS_REJECTED = "rejected"
+
+# Як часто перевіряти таблицю на нові апруви/реджекти (сек)
+POLL_SECONDS = 30
+
+
+# =========================
+# ENV + Google clients
+# =========================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
+GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()  # можна лишити пустим, тоді фото не вантажимо
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "service_account.json").strip()
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is empty in .env / Railway Variables")
+if not GOOGLE_SHEET_ID:
+    raise RuntimeError("GOOGLE_SHEET_ID is empty in .env / Railway Variables")
+
+# Права для Sheets + Drive
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
 ]
 
+if not os.path.exists(GOOGLE_SERVICE_ACCOUNT_JSON):
+    raise RuntimeError(f"{GOOGLE_SERVICE_ACCOUNT_JSON} not found in project folder")
 
-# =====================
-# TEXTS (милі)
-# =====================
-UA_INTRO = (
-    "Привіт! 👋💛\n\n"
-    "Тут ви можете податись на фотозйомку.\n"
-    "Я поставлю кілька запитань — це потрібно лише для оформлення модельного релізу.\n\n"
-    "Важливо:\n"
-    "• Всі текстові відповіді (імʼя, місто, адреса, email) — англійською\n"
-    "• Телефон — тільки цифри у форматі 380931111111\n"
-    "• Адреса (вулиця/будинок) — необовʼязкова, можна написати ДАЛІ\n\n"
-    "До речі, можна приходити з родичами — будемо раді всім 😊"
-)
+creds = Credentials.from_service_account_file(GOOGLE_SERVICE_ACCOUNT_JSON, scopes=SCOPES)
+gc = gspread.authorize(creds)
+sheets_doc = gc.open_by_key(GOOGLE_SHEET_ID)
 
-UA_READY = "Коли будете готові — натисніть кнопку нижче 👇"
-
-UA_FINISH = (
-    "Дякуємо! 💛 Ваша заявка успішно надіслана.\n\n"
-    "Менеджер опрацьовує списки ближче до дати зйомки.\n"
-    "Інформацію по локації та точним деталям ми надішлемо ближче до зйомки.\n"
-    "На майданчику вас зустріне адміністратор і підкаже все необхідне.\n\n"
-    "Хочете подати ще одну людину?"
-)
+drive = build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-# =====================
-# VALIDATION + HELPERS
-# =====================
-EN_TEXT_RE = re.compile(r"^[A-Za-z0-9\s\-\.'\,/#]+$")
-PHONE_RE = re.compile(r"^380\d{9}$")
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-ZIP_RE = re.compile(r"^\d{4,10}$")
+# =========================
+# Helpers
+# =========================
 
-def is_en(s: str) -> bool:
-    s = s.strip()
-    return bool(s) and bool(EN_TEXT_RE.fullmatch(s))
+def ua_date_to_mmddyyyy(dotted: str) -> str:
+    # "17.05.1994" -> "05/17/1994"
+    m = re.fullmatch(r"\s*(\d{1,2})\.(\d{1,2})\.(\d{4})\s*", dotted)
+    if not m:
+        raise ValueError("bad date")
+    dd, mm, yyyy = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    return f"{mm:02d}/{dd:02d}/{yyyy:04d}"
 
-def is_phone(s: str) -> bool:
-    return bool(PHONE_RE.fullmatch(s.strip()))
+def shootdate_to_mmddyyyy(dotted: str) -> str:
+    # вкладки у нас "10.01.2026" -> "01/10/2026"
+    return ua_date_to_mmddyyyy(dotted)
 
-def is_email(s: str) -> bool:
-    return bool(EMAIL_RE.fullmatch(s.strip()))
+def now_iso() -> str:
+    return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def is_zip(s: str) -> bool:
-    return bool(ZIP_RE.fullmatch(s.strip()))
+def only_english(text: str) -> bool:
+    # дозволяємо латиницю, пробіли, дефіси, апостроф, крапки, коми
+    return bool(re.fullmatch(r"[A-Za-z0-9\s\-\.'\,/]+", text.strip()))
 
-def is_next_ua(s: str) -> bool:
-    s = s.strip().lower()
-    return s in {"далі", "дали", "далi", "next"}
+def clean_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", s.strip())
 
-def normalize_name_key(name: str) -> str:
-    return re.sub(r"\s+", " ", name.strip()).lower()
+def is_phone_ua(s: str) -> bool:
+    return bool(re.fullmatch(r"380\d{9}", s.strip()))
 
-def ddmmyyyy_to_mmddyyyy(ddmmyyyy: str) -> str:
-    d, m, y = ddmmyyyy.split(".")
-    return f"{m}/{d}/{y}"
+def ensure_tab_exists(tab_name: str):
+    try:
+        sheets_doc.worksheet(tab_name)
+        return
+    except Exception:
+        sheets_doc.add_worksheet(title=tab_name, rows=2000, cols=40)
 
-def mmddyyyy_tab_name(mmddyyyy: str) -> str:
-    return mmddyyyy.replace("/", "-")
+def ensure_headers(tab_name: str, required_headers: List[str]):
+    ws = sheets_doc.worksheet(tab_name)
+    row1 = ws.row_values(1)
+    if not row1:
+        ws.update("A1", [required_headers])
+        return
 
-def is_dob_ua(text: str) -> bool:
-    return bool(re.fullmatch(r"\d{2}[./]\d{2}[./]\d{4}", text.strip()))
+    # якщо колонки частково є — додаємо відсутні в кінець
+    existing = [h.strip() for h in row1]
+    to_add = [h for h in required_headers if h not in existing]
+    if to_add:
+        new_headers = existing + to_add
+        ws.update("A1", [new_headers])
 
-def dob_ua_to_mmddyyyy(text: str) -> str:
-    t = text.strip().replace("/", ".")
-    d, m, y = t.split(".")
-    return f"{m}/{d}/{y}"
+def ensure_all_tabs_and_headers():
+    # базовий набір колонок релізу + наші службові
+    headers = [
+        "Nameprint",
+        "DateSigned",
+        "ShootDate",
+        "ShootPlace",
+        "ShootState",
+        "ModelName",
+        "DateOfBirth",
+        "ResidenceAddress",
+        "City",
+        "State",
+        "Country",
+        "ZipCode",
+        "Phone",
+        "Email",
+        "GuardianName",
+        "DateSigneded",
+        "Photo",
+        # Нові, як ти просила:
+        "TelegramChatId",
+        "Status",
+        "NotifiedAt",
+    ]
 
-def missing_required(data: dict, keys: list[str]) -> bool:
-    return any(k not in data or data.get(k) is None for k in keys)
+    for d in SHOOT_DATES:
+        ensure_tab_exists(d)
+        ensure_headers(d, headers)
+
+def append_row(tab_name: str, row: Dict[str, Any]):
+    ws = sheets_doc.worksheet(tab_name)
+    headers = ws.row_values(1)
+    # підстраховка: якщо раптом заголовки не ті
+    if not headers:
+        ensure_all_tabs_and_headers()
+        headers = ws.row_values(1)
+
+    values = []
+    for h in headers:
+        values.append(row.get(h, ""))
+
+    ws.append_row(values, value_input_option="USER_ENTERED")
+
+def find_duplicate_name(tab_name: str, model_name: str) -> bool:
+    ws = sheets_doc.worksheet(tab_name)
+    headers = ws.row_values(1)
+    if not headers or "ModelName" not in headers:
+        return False
+    col = headers.index("ModelName") + 1
+    col_vals = ws.col_values(col)[1:]  # без заголовка
+    norm = model_name.strip().lower()
+    return any((v or "").strip().lower() == norm for v in col_vals)
+
+def upload_photo_to_drive(file_bytes: bytes, filename: str) -> str:
+    if not GOOGLE_DRIVE_FOLDER_ID:
+        return ""  # фото не вантажимо
+    media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype="image/jpeg", resumable=False)
+    body = {"name": filename, "parents": [GOOGLE_DRIVE_FOLDER_ID]}
+    created = drive.files().create(body=body, media_body=media, fields="id").execute()
+    return created.get("id", "")
+
+def set_cell(ws, row_idx: int, col_name: str, value: str):
+    headers = ws.row_values(1)
+    if col_name not in headers:
+        return
+    col_idx = headers.index(col_name) + 1
+    ws.update_cell(row_idx, col_idx, value)
+
+def get_col(ws, col_name: str) -> Optional[int]:
+    headers = ws.row_values(1)
+    if not headers or col_name not in headers:
+        return None
+    return headers.index(col_name) + 1
 
 
-# =====================
-# KEYBOARDS
-# =====================
-def kb_begin():
+# =========================
+# Bot state (простий словник по chat_id)
+# =========================
+
+FORM: Dict[int, Dict[str, Any]] = {}
+
+def reset_form(chat_id: int):
+    FORM[chat_id] = {
+        "ShootDateHuman": "",
+        "ShootTime": "",
+        "ModelName": "",
+        "DateOfBirth": "",
+        "Phone": "",
+        "Email": "",
+        "ResidenceAddress": "",
+        "City": "",
+        "ZipCode": "",
+        "GuardianName": "",
+        "PhotoFileId": "",
+        "PhotoDriveId": "",
+        "SkipAddress": False,
+    }
+
+def kb_start():
+    rb = ReplyKeyboardBuilder()
+    rb.button(text="📝 Подати заявку на зйомку")
+    rb.adjust(1)
+    return rb.as_markup(resize_keyboard=True)
+
+def ikb_dates():
     kb = InlineKeyboardBuilder()
-    kb.button(text="📝 Подати заявку на зйомку", callback_data="begin:yes")
-    return kb.as_markup()
-
-def kb_dates():
-    kb = InlineKeyboardBuilder()
-    for d in DATES:
+    for d in SHOOT_DATES:
         kb.button(text=d, callback_data=f"date:{d}")
     kb.adjust(2)
     return kb.as_markup()
 
-def kb_times():
+def ikb_times():
     kb = InlineKeyboardBuilder()
-    for t in TIMES:
+    for t in SHOOT_TIMES:
         kb.button(text=t, callback_data=f"time:{t}")
-    kb.adjust(2)
+    kb.adjust(3)
     return kb.as_markup()
 
-def kb_minor():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Так, мені менше 18", callback_data="minor:yes")
-    kb.button(text="Ні, мені 18+", callback_data="minor:no")
-    kb.adjust(1)
-    return kb.as_markup()
+def rb_next_only():
+    rb = ReplyKeyboardBuilder()
+    rb.button(text="ДАЛІ")
+    rb.adjust(1)
+    return rb.as_markup(resize_keyboard=True)
 
-def kb_consent():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Погоджуюсь", callback_data="consent:yes")
-    return kb.as_markup()
-
-def kb_more():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="➕ Подати ще одну людину", callback_data="more:yes")
-    kb.button(text="✅ Завершити", callback_data="more:no")
-    kb.adjust(1)
-    return kb.as_markup()
+def rb_submit_more():
+    rb = ReplyKeyboardBuilder()
+    rb.button(text="➕ Подати ще одну людину")
+    rb.button(text="✅ Готово")
+    rb.adjust(1)
+    return rb.as_markup(resize_keyboard=True)
 
 
-# =====================
-# STATES
-# =====================
-class Form(StatesGroup):
-    shoot_date = State()
-    shoot_time = State()
+# =========================
+# Aiogram setup
+# =========================
 
-    model_name = State()
-    dob = State()
-
-    residence_address = State()
-    city = State()
-
-    phone = State()
-    email = State()
-
-    minor = State()
-    guardian_name = State()
-
-    photo = State()
-    consent = State()
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
 
-# =====================
-# GOOGLE AUTH
-# =====================
-def sheets_service_creds():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    return ServiceAccountCredentials.from_service_account_file(SA_JSON, scopes=scopes)
+# =========================
+# Handlers
+# =========================
 
-def drive_user_creds():
-    scopes = ["https://www.googleapis.com/auth/drive.file"]
-    creds = UserCredentials.from_authorized_user_file("token_drive.json", scopes)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        with open("token_drive.json", "w") as f:
-            f.write(creds.to_json())
-    return creds
-
-def ensure_sheet_tab(gc: gspread.Client, sheet_id: str, shoot_date_mmddyyyy: str):
-    sh = gc.open_by_key(sheet_id)
-    tab = mmddyyyy_tab_name(shoot_date_mmddyyyy)
-    try:
-        ws = sh.worksheet(tab)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=tab, rows=1000, cols=40)
-        ws.append_row(HEADER)
-    return ws
-
-def model_exists_in_tab(ws, model_name: str) -> bool:
-    try:
-        col = ws.col_values(6)
-    except Exception:
-        return False
-    key = normalize_name_key(model_name)
-    for v in col[1:]:
-        if v and normalize_name_key(v) == key:
-            return True
-    return False
-
-
-# =====================
-# DRIVE UPLOAD
-# =====================
-def normalize_filename(shoot_date_ddmmyyyy: str, shoot_time: str, model_name: str, phone: str) -> str:
-    safe_name = re.sub(r"[^A-Za-z0-9]+", "_", model_name.strip()).strip("_")
-    safe_phone = re.sub(r"[^0-9]+", "", phone.strip())
-    safe_time = shoot_time.replace(":", "-")
-    safe_date = shoot_date_ddmmyyyy.replace(".", "-")
-    return f"{safe_date}_{safe_time}_{safe_name}_{safe_phone}.jpg"
-
-async def upload_photo_to_drive(bot: Bot, file_id: str, filename: str) -> str:
-    creds = drive_user_creds()
-    drive = build("drive", "v3", credentials=creds)
-
-    tg_file = await bot.get_file(file_id)
-    file_bytes = await bot.download_file(tg_file.file_path)
-    data = file_bytes.read()
-
-    media = MediaInMemoryUpload(data, mimetype="image/jpeg", resumable=False)
-    metadata = {"name": filename, "parents": [DRIVE_FOLDER_ID]}
-    created = drive.files().create(
-        body=metadata,
-        media_body=media,
-        fields="webViewLink"
-    ).execute()
-
-    return created["webViewLink"]
-
-
-# =====================
-# HANDLERS
-# =====================
-async def cmd_start(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(UA_INTRO)
-    await message.answer(UA_READY, reply_markup=kb_begin())
-
-async def on_begin(call: CallbackQuery, state: FSMContext):
-    await call.answer()
-    await state.clear()
-    await call.message.answer("Чудово! 😊 Почнемо.\n\nОберіть, будь ласка, дату зйомки 📅", reply_markup=kb_dates())
-    await state.set_state(Form.shoot_date)
-
-async def on_date(call: CallbackQuery, state: FSMContext):
-    date_val = call.data.split(":", 1)[1]
-    await state.update_data(shoot_date=date_val)
-    await call.message.answer("Супер! ✨ Тепер оберіть зручний час ⏰", reply_markup=kb_times())
-    await state.set_state(Form.shoot_time)
-    await call.answer()
-
-async def on_time(call: CallbackQuery, state: FSMContext):
-    time_val = call.data.split(":", 1)[1]
-    await state.update_data(shoot_time=time_val)
-    await call.message.answer(
-        "Чудово 😊\n"
-        "Напишіть, будь ласка, імʼя та прізвище англійською (як у паспорті).\n"
-        "Це потрібно для модельного релізу 💛"
+@dp.message(CommandStart())
+async def start(m: Message):
+    reset_form(m.chat.id)
+    await m.answer(
+        "Привіт 💛\n"
+        "Я допоможу подати заявку на зйомку.\n\n"
+        "Натисніть кнопку нижче, щоб почати 👇",
+        reply_markup=kb_start()
     )
-    await state.set_state(Form.model_name)
-    await call.answer()
 
-async def on_model_name(message: Message, state: FSMContext):
-    text = message.text.strip()
-    if not is_en(text):
-        await message.answer("Трошки не так 🙂 Введіть, будь ласка, англійською. Приклад: Anna Ivanova")
+@dp.message(F.text == "📝 Подати заявку на зйомку")
+async def apply_start(m: Message):
+    reset_form(m.chat.id)
+    await m.answer(
+        "Супер 😊\n"
+        "Оберіть, будь ласка, дату зйомки (кожен день — окрема вкладка в таблиці):",
+        reply_markup=ikb_dates()
+    )
+
+@dp.callback_query(F.data.startswith("date:"))
+async def pick_date(cq: CallbackQuery):
+    d = cq.data.split(":", 1)[1]
+    FORM.setdefault(cq.message.chat.id, {})
+    FORM[cq.message.chat.id]["ShootDateHuman"] = d
+    await cq.message.answer(
+        f"Чудово! Дата: {d}\n\nТепер оберіть час:",
+        reply_markup=ikb_times()
+    )
+    await cq.answer()
+
+@dp.callback_query(F.data.startswith("time:"))
+async def pick_time(cq: CallbackQuery):
+    t = cq.data.split(":", 1)[1]
+    FORM[cq.message.chat.id]["ShootTime"] = t
+
+    await cq.message.answer(
+        "Тепер ім’я та прізвище англійською (як у закордонному паспорті).\n"
+        "Приклад: Anastasiia Svitylko",
+        reply_markup=None
+    )
+    await cq.answer()
+
+@dp.message(F.text)
+async def text_router(m: Message):
+    chat_id = m.chat.id
+    if chat_id not in FORM:
+        reset_form(chat_id)
+
+    data = FORM[chat_id]
+    text = (m.text or "").strip()
+
+    # якщо ще не вибрали дату/час — ігноруємо
+    if not data.get("ShootDateHuman") or not data.get("ShootTime"):
         return
 
-    data = await state.get_data()
-    shoot_date_mmddyyyy = ddmmyyyy_to_mmddyyyy(data["shoot_date"])
-
-    try:
-        gc = gspread.authorize(sheets_service_creds())
-        ws = ensure_sheet_tab(gc, SHEET_ID, shoot_date_mmddyyyy)
-        if model_exists_in_tab(ws, text):
-            await message.answer(
-                "Схоже, така людина вже подана на цю дату 🙂\n"
-                "Якщо це інша людина з таким самим ім’ям — додайте middle name або ініціал.\n\n"
-                "Спробуйте ще раз, будь ласка 💛"
+    # 1) ModelName
+    if not data.get("ModelName"):
+        if not only_english(text):
+            await m.answer("Будь ласка, введіть ім’я та прізвище лише англійськими літерами 😊")
+            return
+        model_name = clean_spaces(text)
+        # дублікати по імені у вибраній вкладці-дні
+        if find_duplicate_name(data["ShootDateHuman"], model_name):
+            await m.answer(
+                "Здається, заявка з таким ім’ям у цей день уже є 🤍\n"
+                "Будь ласка, уточніть ім’я (наприклад додайте середній ініціал) і надішліть ще раз англійською."
             )
             return
-    except Exception:
-        pass
-
-    await state.update_data(model_name=text)
-    await message.answer(
-        "Тепер дата народження 🗓\n"
-        "Будь ласка, введіть у форматі: день.місяць.рік\n"
-        "Наприклад: 22.12.1998"
-    )
-    await state.set_state(Form.dob)
-
-async def on_dob(message: Message, state: FSMContext):
-    text = message.text.strip()
-    if not is_dob_ua(text):
-        await message.answer("Майже 🙂 Формат має бути: день.місяць.рік. Приклад: 22.12.1998")
-        return
-
-    await state.update_data(dob=dob_ua_to_mmddyyyy(text))
-
-    await message.answer(
-        "Дякую 💛\n\n"
-        "Тепер адреса проживання 🏡\n"
-        "Якщо вам комфортно — додайте, будь ласка, адресу англійською (вулиця, будинок).\n"
-        "Якщо не хочете заповнювати — це абсолютно ок 😊 менеджер зможе уточнити це питання пізніше.\n\n"
-        "Якщо пропускаєте — просто напишіть: ДАЛІ"
-    )
-    await state.set_state(Form.residence_address)
-
-async def on_residence_address(message: Message, state: FSMContext):
-    text = message.text.strip()
-
-    # Якщо людина пише ДАЛІ — пропускаємо адресу/місто/область/індекс одразу
-    if is_next_ua(text):
-        await state.update_data(residence_address="", city="")
-        await message.answer(
-            "Ок 💛 Тоді йдемо далі.\n\n"
-            "Напишіть, будь ласка, номер телефону 📞\n"
-            "Тільки цифри у форматі: 380931111111"
-        )
-        await state.set_state(Form.phone)
-        return
-
-    if not is_en(text):
-        await message.answer(
-            "Трошки не так 🙂\n"
-            "Адресу, будь ласка, введіть англійською (наприклад: 12 Khreshchatyk St).\n"
-            "А якщо не хочете заповнювати — просто напишіть: ДАЛІ 💛"
+        data["ModelName"] = model_name
+        await m.answer(
+            "Дякую 💛\n\n"
+            "Дата народження 🗓\n"
+            "Введіть у форматі: день.місяць.рік\n"
+            "Приклад: 05.07.1996"
         )
         return
 
-    await state.update_data(residence_address=text)
-    await message.answer("Супер, дякую! ✨ Тепер напишіть місто проживання англійською. Приклад: Kyiv")
-    await state.set_state(Form.city)
-
-async def on_city(message: Message, state: FSMContext):
-    text = message.text.strip()
-    if not is_en(text):
-        await message.answer("Будь ласка, англійською 💛 Приклад: Kyiv")
-        return
-
-    await state.update_data(city=text)
-    await message.answer("І ще номер телефону 📞 Тільки цифри у форматі: 380931111111")
-    await state.set_state(Form.phone)
-
-async def on_phone(message: Message, state: FSMContext):
-    text = message.text.strip()
-    if not is_phone(text):
-        await message.answer("Майже 🙂 Номер має виглядати ось так: 380931111111 (тільки цифри)")
-        return
-    await state.update_data(phone=text)
-    await message.answer("Тепер email ✉️ Приклад: name@gmail.com")
-    await state.set_state(Form.email)
-
-async def on_email(message: Message, state: FSMContext):
-    text = message.text.strip()
-    if not is_email(text):
-        await message.answer("Схоже, email написаний з помилкою 🙂 Приклад: name@gmail.com")
-        return
-    await state.update_data(email=text)
-    await message.answer("Вам менше 18 років?", reply_markup=kb_minor())
-    await state.set_state(Form.minor)
-
-async def on_minor(call: CallbackQuery, state: FSMContext):
-    choice = call.data.split(":", 1)[1]
-    await call.answer()
-
-    if choice == "yes":
-        await state.update_data(minor=True)
-        await call.message.answer(
-            "Добре 💛\n"
-            "Тоді, будь ласка, напишіть імʼя та прізвище опікуна англійською.\n"
-            "Це потрібно для дитячого модельного релізу 👨‍👩‍👧"
-        )
-        await state.set_state(Form.guardian_name)
-    else:
-        await state.update_data(minor=False, guardian_name="")
-        await call.message.answer(
-            "Супер ✨ Тепер завантажте, будь ласка, портретне фото 📸\n"
-            "Можна як фото або як файл."
-        )
-        await state.set_state(Form.photo)
-
-async def on_guardian_name(message: Message, state: FSMContext):
-    text = message.text.strip()
-    if not is_en(text):
-        await message.answer("Будь ласка, англійською 💛 Приклад: Olha Ivanova")
-        return
-    await state.update_data(guardian_name=text)
-    await message.answer("Дякую! ✨ Тепер завантажте, будь ласка, портретне фото 📸")
-    await state.set_state(Form.photo)
-
-async def on_photo(message: Message, state: FSMContext, bot: Bot):
-    file_id = None
-    if message.photo:
-        file_id = message.photo[-1].file_id
-    elif message.document and (message.document.mime_type or "").startswith("image/"):
-        file_id = message.document.file_id
-
-    if not file_id:
-        await message.answer("Це не схоже на фото 🙂 Надішліть, будь ласка, портретне фото.")
-        return
-
-    data = await state.get_data()
-    required = ["shoot_date", "shoot_time", "model_name", "phone"]
-    if missing_required(data, required):
-        await message.answer("Ой 🙈 анкета перервалася. Почнемо спочатку: /start")
-        await state.clear()
-        return
-
-    filename = normalize_filename(data["shoot_date"], data["shoot_time"], data["model_name"], data["phone"])
-    await message.answer("Дякую! 💛 Завантажую фото…")
-
-    try:
-        drive_url = await upload_photo_to_drive(bot, file_id, filename)
-    except Exception as e:
-        await message.answer(
-            "Не вдалося завантажити фото в Google Drive 😔\n"
-            "Спробуйте ще раз або напишіть адміну.\n\n"
-            f"Технічна помилка: {type(e).__name__}"
-        )
-        return
-
-    await state.update_data(photo_drive_url=drive_url)
-
-    await message.answer(
-        "Майже готово ✅\n"
-        "Підтвердіть, будь ласка, що ви погоджуєтесь на використання цих даних для оформлення модельного релізу 💛",
-        reply_markup=kb_consent()
-    )
-    await state.set_state(Form.consent)
-
-async def on_consent(call: CallbackQuery, state: FSMContext):
-    await call.answer()
-    data = await state.get_data()
-
-    required = ["shoot_date", "model_name", "dob", "phone", "email", "photo_drive_url"]
-    if missing_required(data, required):
-        await call.message.answer("Форма не активна 🙈 Почнемо спочатку: /start")
-        await state.clear()
-        return
-
-    shoot_date_mmddyyyy = ddmmyyyy_to_mmddyyyy(data["shoot_date"])
-
-    guardian = (data.get("guardian_name") or "").strip()
-    city_val = (data.get("city") or "").strip()
-
-    try:
-        gc = gspread.authorize(sheets_service_creds())
-        ws = ensure_sheet_tab(gc, SHEET_ID, shoot_date_mmddyyyy)
-        if model_exists_in_tab(ws, data["model_name"]):
-            await call.message.answer(
-                "Схоже, ця людина вже є у списку на цю дату 🙂\n"
-                "Якщо це інша людина з таким самим ім’ям — подайте ще раз з middle name/ініціалом.\n\n"
-                "Натисніть: Подати ще одну людину",
-                reply_markup=kb_more()
-            )
-            await state.clear()
+    # 2) DateOfBirth
+    if not data.get("DateOfBirth"):
+        try:
+            dob_mmddyyyy = ua_date_to_mmddyyyy(text)
+        except Exception:
+            await m.answer("Трішки не той формат 🙏 Спробуйте так: 05.07.1996")
             return
+        data["DateOfBirth"] = dob_mmddyyyy
+        await m.answer(
+            "Супер 😊\n\n"
+            "Номер телефону у форматі 380931111111 (без +, без пробілів):"
+        )
+        return
+
+    # 3) Phone
+    if not data.get("Phone"):
+        if not is_phone_ua(text):
+            await m.answer("Потрібен формат рівно так: 380931111111 🙏 Спробуйте ще раз.")
+            return
+        data["Phone"] = text
+        await m.answer(
+            "Електронна пошта ✉️\n"
+            "Приклад: name@example.com"
+        )
+        return
+
+    # 4) Email
+    if not data.get("Email"):
+        email = text.strip()
+        if "@" not in email or "." not in email:
+            await m.answer("Здається, email написаний з помилкою 😊 Спробуйте ще раз.")
+            return
+        data["Email"] = email
+        await m.answer(
+            "Адреса проживання 🏡\n"
+            "Якщо вам комфортно — додайте, будь ласка, адресу англійською (вулиця, будинок).\n"
+            "Якщо не хочете — це абсолютно ок 😊 менеджер зможе уточнити це пізніше.\n\n"
+            "Напишіть адресу англійською або натисніть ДАЛІ:",
+            reply_markup=rb_next_only()
+        )
+        return
+
+    # 5) ResidenceAddress (optional)
+    if data.get("ResidenceAddress") == "" and not data.get("City"):
+        # ми ще на кроці адреси
+        if text.upper() == "ДАЛІ":
+            data["SkipAddress"] = True
+            data["ResidenceAddress"] = ""
+            # якщо адреса пропущена — не питаємо місто/індекс (як ти просила)
+            data["City"] = ""
+            data["ZipCode"] = ""
+            await m.answer(
+                "Добре 💛\n\n"
+                "І ще одне питання: ім’я та прізвище опікуна (якщо модель неповнолітня).\n"
+                "Якщо повнолітня — напишіть: NONE"
+            )
+            return
+
+        if not only_english(text):
+            await m.answer("Адресу, будь ласка, англійською 😊 Або натисніть ДАЛІ.")
+            return
+        data["ResidenceAddress"] = clean_spaces(text)
+        # якщо адреса є — питаємо лише місто (як ти просила), без області
+        await m.answer(
+            "Дякую 💛\n\nМісто проживання англійською.\nПриклад: Kyiv"
+        )
+        return
+
+    # 6) City (тільки якщо адресу ввели)
+    if data.get("ResidenceAddress") and not data.get("City"):
+        if not only_english(text):
+            await m.answer("Місто, будь ласка, англійською 😊 Приклад: Kyiv")
+            return
+        data["City"] = clean_spaces(text)
+        await m.answer(
+            "Поштовий індекс (Zip Code) — якщо маєте.\n"
+            "Якщо не знаєте — напишіть: NONE"
+        )
+        return
+
+    # 7) ZipCode (тільки якщо адресу ввели)
+    if data.get("ResidenceAddress") and not data.get("ZipCode"):
+        z = text.strip()
+        if z.upper() == "NONE":
+            z = ""
+        data["ZipCode"] = z
+        await m.answer(
+            "Ім’я та прізвище опікуна (якщо модель неповнолітня).\n"
+            "Якщо повнолітня — напишіть: NONE"
+        )
+        return
+
+    # 8) GuardianName
+    if not data.get("GuardianName"):
+        g = clean_spaces(text)
+        if g.upper() == "NONE":
+            g = ""
+        else:
+            if not only_english(g):
+                await m.answer("Опікуна, будь ласка, англійською 😊 Або NONE")
+                return
+        data["GuardianName"] = g
+        await m.answer(
+            "Останній крок 📸\n"
+            "Надішліть, будь ласка, портретне фото (селфі або портрет), без фільтрів бажано 😊"
+        )
+        return
+
+    # якщо ми вже попросили фото — текст ігноруємо
+    return
+
+
+@dp.message(F.photo)
+async def got_photo(m: Message):
+    chat_id = m.chat.id
+    if chat_id not in FORM:
+        reset_form(chat_id)
+    data = FORM[chat_id]
+
+    if not data.get("GuardianName"):
+        await m.answer("Спочатку відповімо на питання вище 😊")
+        return
+
+    # беремо найбільший розмір фото
+    ph = m.photo[-1]
+    file = await bot.get_file(ph.file_id)
+    file_bytes = await bot.download_file(file.file_path)
+
+    # upload to Drive (optional)
+    drive_id = ""
+    try:
+        drive_id = upload_photo_to_drive(file_bytes.read(), f"{data['ModelName'].replace(' ', '_')}.jpg")
     except Exception:
-        ws = None
+        drive_id = ""
 
-    row = [
-        NAMEPRINT_CONST,
-        shoot_date_mmddyyyy,
-        shoot_date_mmddyyyy,
-        SHOOTPLACE_CONST,
-        SHOOTSTATE_CONST,
-        data["model_name"].strip(),
-        data["dob"].strip(),
-        (data.get("residence_address") or "").strip(),
-        city_val,
-        "",
-        COUNTRY_CONST,
-        "",
-        data["phone"].strip(),
-        data["email"].strip(),
-        guardian,
-        shoot_date_mmddyyyy,
-        data["photo_drive_url"].strip(),
-    ]
+    data["PhotoDriveId"] = drive_id
 
-    if ws is None:
-        gc = gspread.authorize(sheets_service_creds())
-        ws = ensure_sheet_tab(gc, SHEET_ID, shoot_date_mmddyyyy)
+    # готуємо рядок для Google Sheet
+    shoot_date_tab = data["ShootDateHuman"]
+    shoot_mmddyyyy = shootdate_to_mmddyyyy(shoot_date_tab)
 
-    ws.append_row(row)
+    row = {
+        "Nameprint": NAMEPRINT_CONST,
+        "DateSigned": shoot_mmddyyyy,       # як ти просила: DateSigned = ShootDate (день зйомки)
+        "ShootDate": shoot_mmddyyyy,
+        "ShootPlace": SHOOTPLACE_CONST,
+        "ShootState": SHOOTSTATE_CONST,
+        "ModelName": data["ModelName"],
+        "DateOfBirth": data["DateOfBirth"],  # уже у MM/DD/YYYY
+        "ResidenceAddress": data["ResidenceAddress"],
+        "City": data["City"],
+        "State": "",                         # ми не питаємо область
+        "Country": "Ukraine",
+        "ZipCode": data["ZipCode"],
+        "Phone": data["Phone"],
+        "Email": data["Email"],
+        "GuardianName": data["GuardianName"],
+        "DateSigneded": shoot_mmddyyyy,
+        "Photo": drive_id,                   # тут збережемо Drive fileId (або пусто)
+        "TelegramChatId": str(chat_id),
+        "Status": "",                        # менеджер поставить approved/rejected
+        "NotifiedAt": "",                    # бот заповнить коли повідомить
+    }
 
-    await call.message.answer(UA_FINISH, reply_markup=kb_more())
-    await state.clear()
+    # гарантуємо вкладки + заголовки перед записом
+    ensure_all_tabs_and_headers()
+    append_row(shoot_date_tab, row)
 
-async def on_more(call: CallbackQuery, state: FSMContext):
-    await call.answer()
-    choice = call.data.split(":", 1)[1]
-    await state.clear()
+    await m.answer(
+        "Дякуємо! 💛 Ваша заявка успішно надіслана.\n\n"
+        "Менеджер опрацьовує списки ближче до дати зйомки.\n"
+        "Інформація по локації та деталях буде надіслана ближче до зйомки.\n"
+        "На майданчику вас зустріне адміністратор і підкаже все необхідне 😊\n\n"
+        "Хочете подати ще одну людину?",
+        reply_markup=rb_submit_more()
+    )
 
-    if choice == "yes":
-        await call.message.answer("Супер! 😊 Подамо ще одну людину ✨")
-        await call.message.answer("Оберіть, будь ласка, дату зйомки 📅", reply_markup=kb_dates())
-        await state.set_state(Form.shoot_date)
-    else:
-        await call.message.answer("Готово 💛 Гарного дня! Якщо що — просто напишіть /start")
+    # підготувати форму на наступну людину (але не стартувати автоматом)
+    reset_form(chat_id)
+    # залишимо дату/час пустими, щоб вона знов натиснула "Подати заявку"
 
+
+@dp.message(F.text == "➕ Подати ще одну людину")
+async def submit_more(m: Message):
+    reset_form(m.chat.id)
+    await m.answer("Супер 😊 Оберіть дату зйомки:", reply_markup=ikb_dates())
+
+@dp.message(F.text == "✅ Готово")
+async def done(m: Message):
+    reset_form(m.chat.id)
+    await m.answer("Домовились 💛 Гарного дня!", reply_markup=kb_start())
+
+
+# =========================
+# Status polling (менеджер ставить Status у таблиці)
+# =========================
+
+async def poll_status_changes():
+    await asyncio.sleep(3)
+    while True:
+        try:
+            ensure_all_tabs_and_headers()
+
+            for tab in SHOOT_DATES:
+                ws = sheets_doc.worksheet(tab)
+
+                col_status = get_col(ws, "Status")
+                col_notified = get_col(ws, "NotifiedAt")
+                col_chat = get_col(ws, "TelegramChatId")
+
+                if not col_status or not col_notified or not col_chat:
+                    continue
+
+                statuses = ws.col_values(col_status)[1:]
+                notified = ws.col_values(col_notified)[1:]
+                chats = ws.col_values(col_chat)[1:]
+
+                # рядки в таблиці починаються з 2 (бо 1 — заголовок)
+                for i, status in enumerate(statuses, start=2):
+                    st = (status or "").strip().lower()
+                    if st not in (STATUS_APPROVED, STATUS_REJECTED):
+                        continue
+
+                    already = (notified[i - 2] or "").strip()
+                    if already:
+                        continue
+
+                    chat_id_str = (chats[i - 2] or "").strip()
+                    if not chat_id_str.isdigit():
+                        set_cell(ws, i, "NotifiedAt", now_iso())
+                        continue
+
+                    chat_id = int(chat_id_str)
+
+                    if st == STATUS_APPROVED:
+                        text = (
+                            "Є хороші новини 💛\n"
+                            "Ваша заявка погоджена ✅\n\n"
+                            "Локацію та деталі менеджер надішле ближче до зйомки."
+                        )
+                    else:
+                        text = (
+                            "Дякуємо за заявку 💛\n"
+                            "На жаль, цього разу не виходить ❌\n\n"
+                            "Будемо раді бачити вас у наступних зйомках 😊"
+                        )
+
+                    try:
+                        await bot.send_message(chat_id, text)
+                    except Exception:
+                        pass
+
+                    set_cell(ws, i, "NotifiedAt", now_iso())
+
+        except Exception:
+            # не валимо бота через тимчасові помилки API
+            pass
+
+        await asyncio.sleep(POLL_SECONDS)
+
+
+# =========================
+# MAIN
+# =========================
 
 async def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is empty in .env")
-    if not SHEET_ID:
-        raise RuntimeError("GOOGLE_SHEET_ID is empty in .env")
-    if not DRIVE_FOLDER_ID:
-        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is empty in .env")
-    if not os.path.exists("service_account.json"):
-        raise RuntimeError("service_account.json not found in project folder")
-    if not os.path.exists("token_drive.json"):
-        raise RuntimeError("token_drive.json not found (run python3 auth_drive.py)")
+    # 1) на старті створюємо вкладки і заголовки (з новими колонками)
+    ensure_all_tabs_and_headers()
 
-    bot = Bot(BOT_TOKEN)
-    dp = Dispatcher(storage=MemoryStorage())
+    # 2) запускаємо фон-перевірку статусів
+    asyncio.create_task(poll_status_changes())
 
-    dp.message.register(cmd_start, CommandStart())
-    dp.callback_query.register(on_begin, F.data == "begin:yes")
-
-    dp.callback_query.register(on_date, F.data.startswith("date:"), Form.shoot_date)
-    dp.callback_query.register(on_time, F.data.startswith("time:"), Form.shoot_time)
-
-    dp.message.register(on_model_name, Form.model_name)
-    dp.message.register(on_dob, Form.dob)
-
-    dp.message.register(on_residence_address, Form.residence_address)
-    dp.message.register(on_city, Form.city)
-
-    dp.message.register(on_phone, Form.phone)
-    dp.message.register(on_email, Form.email)
-
-    dp.callback_query.register(on_minor, F.data.startswith("minor:"), Form.minor)
-    dp.message.register(on_guardian_name, Form.guardian_name)
-
-    dp.message.register(on_photo, Form.photo)
-    dp.callback_query.register(on_consent, F.data == "consent:yes", Form.consent)
-
-    dp.callback_query.register(on_more, F.data.startswith("more:"))
-
+    # 3) стартуємо бота
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
