@@ -2,9 +2,8 @@ import os
 import re
 import io
 import json
-import base64
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
@@ -20,6 +19,7 @@ from google.oauth2.service_account import Credentials as ServiceAccountCredentia
 
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.errors import HttpError
 
 
 # =====================
@@ -29,9 +29,6 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
-
-# Якщо на Railway ти зберігаєш base64 секрети — код сам створить service_account.json
-SERVICE_ACCOUNT_JSON_B64 = os.getenv("SERVICE_ACCOUNT_JSON_B64", "").strip()
 SA_JSON_PATH = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "service_account.json").strip()
 
 
@@ -55,7 +52,7 @@ SHOOTPLACE_CONST = "Ukraine"
 SHOOTSTATE_CONST = "Kyiv"
 COUNTRY_CONST = "Ukraine"
 
-# Додаємо ShootTime (важливо для груп)
+# Додаємо ShootTime + менеджерські колонки
 HEADER = [
     "Nameprint",
     "DateSigned",
@@ -75,7 +72,12 @@ HEADER = [
     "GuardianName",
     "DateSigneded",
     "Photo",
+    "TelegramChatId",
+    "Status",
+    "NotifiedAt",
 ]
+
+STATUS_DEFAULT = "pending"
 
 
 # =====================
@@ -83,14 +85,15 @@ HEADER = [
 # =====================
 UA_INTRO = (
     "Привіт! 👋💛\n\n"
-    "Тут можна податись на фотозйомку.\n"
-    "Я поставлю кілька питань — це потрібно для оформлення модельного релізу.\n\n"
+    "Тут ви можете податись на фотозйомку.\n"
+    "Я поставлю кілька запитань — це потрібно для оформлення модельного релізу.\n\n"
     "Важливо:\n"
     "• Всі текстові відповіді (імʼя, місто, адреса, email) — англійською\n"
     "• Телефон — тільки цифри у форматі 380931111111\n"
-    "• Адреса (вулиця/будинок) — необовʼязкова, можна написати ДАЛІ\n\n"
-    "До речі, можна приходити з родичами — будемо раді всім 😊"
+    "• Адреса (вулиця/будинок) — НЕ обовʼязкова: якщо не хочете заповнювати — напишіть ДАЛІ 😊\n\n"
+    "До речі, можна приходити з родичами — будемо раді всім 🙂"
 )
+
 UA_READY = "Коли будете готові — натисніть кнопку нижче 👇"
 
 UA_FINISH = (
@@ -110,62 +113,43 @@ PHONE_RE = re.compile(r"^380\d{9}$")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 def is_en(s: str) -> bool:
-    s = s.strip()
+    s = (s or "").strip()
     return bool(s) and bool(EN_TEXT_RE.fullmatch(s))
 
 def is_phone(s: str) -> bool:
-    return bool(PHONE_RE.fullmatch(s.strip()))
+    return bool(PHONE_RE.fullmatch((s or "").strip()))
 
 def is_email(s: str) -> bool:
-    return bool(EMAIL_RE.fullmatch(s.strip()))
+    return bool(EMAIL_RE.fullmatch((s or "").strip()))
 
 def is_next_ua(s: str) -> bool:
-    s = s.strip().lower()
+    s = (s or "").strip().lower()
     return s in {"далі", "дали", "далi", "next"}
 
 def normalize_name_key(name: str) -> str:
-    return re.sub(r"\s+", " ", name.strip()).lower()
+    return re.sub(r"\s+", " ", (name or "").strip()).lower()
 
 def ddmmyyyy_to_mmddyyyy(ddmmyyyy: str) -> str:
     d, m, y = ddmmyyyy.split(".")
     return f"{m}/{d}/{y}"
 
 def mmddyyyy_tab_name(mmddyyyy: str) -> str:
-    # назва вкладки як 01-10-2026
     return mmddyyyy.replace("/", "-")
 
 def is_dob_ua(text: str) -> bool:
-    return bool(re.fullmatch(r"\d{2}[./]\d{2}[./]\d{4}", text.strip()))
+    return bool(re.fullmatch(r"\d{2}[./]\d{2}[./]\d{4}", (text or "").strip()))
 
 def dob_ua_to_mmddyyyy(text: str) -> str:
-    t = text.strip().replace("/", ".")
+    t = (text or "").strip().replace("/", ".")
     d, m, y = t.split(".")
     return f"{m}/{d}/{y}"
 
-def ensure_service_account_json():
-    """
-    Якщо на Railway немає service_account.json (бо він у .gitignore) —
-    створюємо його з SERVICE_ACCOUNT_JSON_B64.
-    """
-    if os.path.exists(SA_JSON_PATH):
-        return
-    if not SERVICE_ACCOUNT_JSON_B64:
-        return
-    raw = base64.b64decode(SERVICE_ACCOUNT_JSON_B64.encode("utf-8"))
-    with open(SA_JSON_PATH, "wb") as f:
-        f.write(raw)
-
-def get_sa_client_email() -> str:
-    try:
-        with open(SA_JSON_PATH, "r", encoding="utf-8") as f:
-            j = json.load(f)
-        return j.get("client_email", "")
-    except Exception:
-        return ""
+def now_iso() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
 # =====================
-# KEYBOARDS (INLINE, без “постійних” кнопок внизу)
+# KEYBOARDS
 # =====================
 def kb_begin():
     kb = InlineKeyboardBuilder()
@@ -230,50 +214,47 @@ class Form(StatesGroup):
 
 
 # =====================
-# GOOGLE (Service Account: Sheets + Drive)
+# GOOGLE AUTH
 # =====================
 def sa_creds(scopes: list[str]):
     return ServiceAccountCredentials.from_service_account_file(SA_JSON_PATH, scopes=scopes)
 
 def sheets_client():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    return gspread.authorize(sa_creds(scopes))
+    creds = sa_creds(["https://www.googleapis.com/auth/spreadsheets"])
+    return gspread.authorize(creds)
 
 def drive_service():
-    scopes = ["https://www.googleapis.com/auth/drive"]
-    return build("drive", "v3", credentials=sa_creds(scopes))
+    creds = sa_creds(["https://www.googleapis.com/auth/drive"])
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-def ensure_sheet_tab(sh_id: str, shoot_date_mmddyyyy: str):
-    gc = sheets_client()
-    sh = gc.open_by_key(sh_id)
+def ensure_tab_and_header(sh: gspread.Spreadsheet, shoot_date_mmddyyyy: str):
     tab = mmddyyyy_tab_name(shoot_date_mmddyyyy)
     try:
         ws = sh.worksheet(tab)
-    except Exception:
-        ws = sh.add_worksheet(title=tab, rows=1000, cols=60)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=tab, rows=2000, cols=max(40, len(HEADER) + 5))
+        ws.append_row(HEADER)
+
+    # ensure header has required columns (append missing)
+    current = ws.row_values(1)
+    if not current:
         ws.append_row(HEADER)
         return ws
 
-    # Якщо вкладка існує, але заголовок ще старий — “дотягнемо” HEADER
-    try:
-        first_row = ws.row_values(1)
-        if not first_row:
-            ws.append_row(HEADER)
-        else:
-            # якщо не вистачає колонок — дописуємо справа
-            if len(first_row) < len(HEADER):
-                ws.update("1:1", [HEADER])
-    except Exception:
-        pass
-
+    missing = [h for h in HEADER if h not in current]
+    if missing:
+        ws.append_row([])  # ensure sheet exists
+        new_header = current + missing
+        ws.update("1:1", [new_header])
     return ws
 
-def model_exists_in_tab(ws, model_name: str) -> bool:
-    try:
-        # ModelName — 7 колонка (1-based), тобто індекс 7
-        col = ws.col_values(7)
-    except Exception:
+def model_exists(ws: gspread.Worksheet, model_name: str) -> bool:
+    # ModelName column index depends on header
+    header = ws.row_values(1)
+    if "ModelName" not in header:
         return False
+    idx = header.index("ModelName") + 1
+    col = ws.col_values(idx)
     key = normalize_name_key(model_name)
     for v in col[1:]:
         if v and normalize_name_key(v) == key:
@@ -282,20 +263,16 @@ def model_exists_in_tab(ws, model_name: str) -> bool:
 
 
 # =====================
-# DRIVE UPLOAD
+# DRIVE UPLOAD (SERVICE ACCOUNT)
 # =====================
 def normalize_filename(shoot_date_ddmmyyyy: str, shoot_time: str, model_name: str, phone: str) -> str:
-    safe_name = re.sub(r"[^A-Za-z0-9]+", "_", model_name.strip()).strip("_")
-    safe_phone = re.sub(r"[^0-9]+", "", phone.strip())
-    safe_time = shoot_time.replace(":", "-")
-    safe_date = shoot_date_ddmmyyyy.replace(".", "-")
+    safe_name = re.sub(r"[^A-Za-z0-9]+", "_", (model_name or "").strip()).strip("_")
+    safe_phone = re.sub(r"[^0-9]+", "", (phone or "").strip())
+    safe_time = (shoot_time or "").replace(":", "-")
+    safe_date = (shoot_date_ddmmyyyy or "").replace(".", "-")
     return f"{safe_date}_{safe_time}_{safe_name}_{safe_phone}.jpg"
 
 async def upload_photo_to_drive_via_sa(bot: Bot, file_id: str, filename: str) -> str:
-    """
-    Завантажує файл у DRIVE_FOLDER_ID через service account.
-    Повертає webViewLink.
-    """
     drive = drive_service()
 
     tg_file = await bot.get_file(file_id)
@@ -304,26 +281,8 @@ async def upload_photo_to_drive_via_sa(bot: Bot, file_id: str, filename: str) ->
 
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype="image/jpeg", resumable=False)
     metadata = {"name": filename, "parents": [DRIVE_FOLDER_ID]}
-
-    created = drive.files().create(
-        body=metadata,
-        media_body=media,
-        fields="id, webViewLink"
-    ).execute()
-
-    file_id_created = created["id"]
-
-    # Робимо “Anyone with the link can view” (щоб менеджеру/скрипту було зручно)
-    # Якщо у вас політика інша — скажи, і я приберу.
-    drive.permissions().create(
-        fileId=file_id_created,
-        body={"type": "anyone", "role": "reader"},
-        fields="id"
-    ).execute()
-
-    # Після permission webViewLink інколи треба ще раз запросити
-    created2 = drive.files().get(fileId=file_id_created, fields="webViewLink").execute()
-    return created2["webViewLink"]
+    created = drive.files().create(body=metadata, media_body=media, fields="id,webViewLink").execute()
+    return created["webViewLink"]
 
 
 # =====================
@@ -366,14 +325,20 @@ async def on_model_name(message: Message, state: FSMContext):
 
     data = await state.get_data()
     shoot_date_mmddyyyy = ddmmyyyy_to_mmddyyyy(data["shoot_date"])
-    ws = ensure_sheet_tab(SHEET_ID, shoot_date_mmddyyyy)
-    if model_exists_in_tab(ws, text):
-        await message.answer(
-            "Схоже, така людина вже подана на цю дату 🙂\n"
-            "Якщо це інша людина з таким самим ім’ям — додайте middle name або ініціал.\n\n"
-            "Спробуйте ще раз, будь ласка 💛"
-        )
-        return
+
+    try:
+        gc = sheets_client()
+        sh = gc.open_by_key(SHEET_ID)
+        ws = ensure_tab_and_header(sh, shoot_date_mmddyyyy)
+        if model_exists(ws, text):
+            await message.answer(
+                "Схоже, така людина вже подана на цю дату 🙂\n"
+                "Якщо це інша людина з таким самим ім’ям — додайте middle name або ініціал.\n\n"
+                "Спробуйте ще раз, будь ласка 💛"
+            )
+            return
+    except Exception:
+        pass
 
     await state.update_data(model_name=text)
     await message.answer(
@@ -403,7 +368,7 @@ async def on_dob(message: Message, state: FSMContext):
 async def on_residence_address(message: Message, state: FSMContext):
     text = message.text.strip()
 
-    # Якщо людина пише ДАЛІ — пропускаємо адресу/місто одразу
+    # Якщо людина пише ДАЛІ — пропускаємо адресу/місто
     if is_next_ua(text):
         await state.update_data(residence_address="", city="")
         await message.answer(
@@ -495,17 +460,24 @@ async def on_photo(message: Message, state: FSMContext, bot: Bot):
         return
 
     data = await state.get_data()
-    required = ["shoot_date", "shoot_time", "model_name", "phone"]
-    if any(k not in data or not data.get(k) for k in required):
-        await message.answer("Ой 🙈 анкета перервалася. Почнемо спочатку: /start")
-        await state.clear()
-        return
+    for k in ["shoot_date", "shoot_time", "model_name", "phone"]:
+        if not data.get(k):
+            await message.answer("Ой 🙈 анкета перервалася. Почнемо спочатку: /start")
+            await state.clear()
+            return
 
     filename = normalize_filename(data["shoot_date"], data["shoot_time"], data["model_name"], data["phone"])
     await message.answer("Дякую! 💛 Завантажую фото…")
 
     try:
         drive_url = await upload_photo_to_drive_via_sa(bot, file_id, filename)
+    except HttpError as e:
+        await message.answer(
+            "Не вдалося завантажити фото в Google Drive 😔\n"
+            "Спробуйте ще раз або напишіть адміну.\n\n"
+            f"Технічна помилка: HttpError ({getattr(e, 'status_code', 'unknown')})"
+        )
+        return
     except Exception as e:
         await message.answer(
             "Не вдалося завантажити фото в Google Drive 😔\n"
@@ -528,16 +500,19 @@ async def on_consent(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
 
     required = ["shoot_date", "shoot_time", "model_name", "dob", "phone", "email", "photo_drive_url"]
-    if any(k not in data or not data.get(k) for k in required):
+    if any(not data.get(k) for k in required):
         await call.message.answer("Форма не активна 🙈 Почнемо спочатку: /start")
         await state.clear()
         return
 
     shoot_date_mmddyyyy = ddmmyyyy_to_mmddyyyy(data["shoot_date"])
-    ws = ensure_sheet_tab(SHEET_ID, shoot_date_mmddyyyy)
+    shoot_time = data["shoot_time"].strip()
 
-    # дубль-guard
-    if model_exists_in_tab(ws, data["model_name"]):
+    gc = sheets_client()
+    sh = gc.open_by_key(SHEET_ID)
+    ws = ensure_tab_and_header(sh, shoot_date_mmddyyyy)
+
+    if model_exists(ws, data["model_name"]):
         await call.message.answer(
             "Схоже, ця людина вже є у списку на цю дату 🙂\n"
             "Якщо це інша людина з таким самим ім’ям — подайте ще раз з middle name/ініціалом.\n\n"
@@ -551,28 +526,30 @@ async def on_consent(call: CallbackQuery, state: FSMContext):
     city_val = (data.get("city") or "").strip()
 
     row = [
-        NAMEPRINT_CONST,
-        shoot_date_mmddyyyy,
-        shoot_date_mmddyyyy,
-        data["shoot_time"].strip(),
-        SHOOTPLACE_CONST,
-        SHOOTSTATE_CONST,
-        data["model_name"].strip(),
-        data["dob"].strip(),
-        (data.get("residence_address") or "").strip(),
-        city_val,
-        "",
-        COUNTRY_CONST,
-        "",
-        data["phone"].strip(),
-        data["email"].strip(),
-        guardian,
-        shoot_date_mmddyyyy,
-        data["photo_drive_url"].strip(),
+        NAMEPRINT_CONST,                 # Nameprint
+        shoot_date_mmddyyyy,             # DateSigned (== day)
+        shoot_date_mmddyyyy,             # ShootDate (== day)
+        shoot_time,                      # ShootTime
+        SHOOTPLACE_CONST,                # ShootPlace
+        SHOOTSTATE_CONST,                # ShootState
+        data["model_name"].strip(),      # ModelName
+        data["dob"].strip(),             # DateOfBirth (mm/dd/yyyy)
+        (data.get("residence_address") or "").strip(),  # ResidenceAddress
+        city_val,                        # City
+        "",                              # State
+        COUNTRY_CONST,                   # Country
+        "",                              # ZipCode
+        data["phone"].strip(),           # Phone
+        data["email"].strip(),           # Email
+        guardian,                        # GuardianName
+        shoot_date_mmddyyyy,             # DateSigneded
+        data["photo_drive_url"].strip(), # Photo
+        str(call.from_user.id),          # TelegramChatId
+        STATUS_DEFAULT,                  # Status
+        "",                              # NotifiedAt
     ]
 
     ws.append_row(row)
-
     await call.message.answer(UA_FINISH, reply_markup=kb_more())
     await state.clear()
 
@@ -590,16 +567,15 @@ async def on_more(call: CallbackQuery, state: FSMContext):
 
 
 async def main():
-    ensure_service_account_json()
-
+    # Мінімальні перевірки
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is empty")
+        raise RuntimeError("BOT_TOKEN is empty (set Railway Variables)")
     if not SHEET_ID:
-        raise RuntimeError("GOOGLE_SHEET_ID is empty")
+        raise RuntimeError("GOOGLE_SHEET_ID is empty (set Railway Variables)")
     if not DRIVE_FOLDER_ID:
-        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is empty")
+        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is empty (set Railway Variables)")
     if not os.path.exists(SA_JSON_PATH):
-        raise RuntimeError("service_account.json not found (set SERVICE_ACCOUNT_JSON_B64 in Railway Variables)")
+        raise RuntimeError("service_account.json not found (did init_secrets.py create it?)")
 
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
