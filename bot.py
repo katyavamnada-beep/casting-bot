@@ -1,9 +1,7 @@
 import os
 import re
-import io
-import json
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
@@ -18,8 +16,7 @@ import gspread
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
-from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaInMemoryUpload
 
 
 # =====================
@@ -29,7 +26,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
-SA_JSON_PATH = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "service_account.json").strip()
+SA_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "service_account.json").strip()
 
 
 # =====================
@@ -52,12 +49,11 @@ SHOOTPLACE_CONST = "Ukraine"
 SHOOTSTATE_CONST = "Kyiv"
 COUNTRY_CONST = "Ukraine"
 
-# Додаємо ShootTime + менеджерські колонки
+# Колонки релізу + менеджерські колонки в кінці
 HEADER = [
     "Nameprint",
     "DateSigned",
     "ShootDate",
-    "ShootTime",
     "ShootPlace",
     "ShootState",
     "ModelName",
@@ -72,26 +68,30 @@ HEADER = [
     "GuardianName",
     "DateSigneded",
     "Photo",
+    # додали час (для груп)
+    "ShootTime",
+    # менеджерські
     "TelegramChatId",
     "Status",
     "NotifiedAt",
 ]
 
-STATUS_DEFAULT = "pending"
+STATUS_APPROVED = "Approved"
+STATUS_REJECTED = "Rejected"
 
 
 # =====================
-# TEXTS (милі)
+# TEXTS (милі, як було)
 # =====================
 UA_INTRO = (
     "Привіт! 👋💛\n\n"
     "Тут ви можете податись на фотозйомку.\n"
-    "Я поставлю кілька запитань — це потрібно для оформлення модельного релізу.\n\n"
+    "Я поставлю кілька запитань — це потрібно лише для оформлення модельного релізу.\n\n"
     "Важливо:\n"
     "• Всі текстові відповіді (імʼя, місто, адреса, email) — англійською\n"
     "• Телефон — тільки цифри у форматі 380931111111\n"
-    "• Адреса (вулиця/будинок) — НЕ обовʼязкова: якщо не хочете заповнювати — напишіть ДАЛІ 😊\n\n"
-    "До речі, можна приходити з родичами — будемо раді всім 🙂"
+    "• Адреса (вулиця/будинок) — необовʼязкова: якщо не хочете, просто напишіть ДАЛІ 💛\n\n"
+    "До речі, можна приходити з родичами — будемо раді всім 😊"
 )
 
 UA_READY = "Коли будете готові — натисніть кнопку нижче 👇"
@@ -104,6 +104,18 @@ UA_FINISH = (
     "Хочете подати ще одну людину?"
 )
 
+UA_APPROVED = (
+    "Вітаємо! 💛\n"
+    "Ваша заявка погоджена ✅\n\n"
+    "Деталі по локації/часу менеджер надішле ближче до зйомки."
+)
+
+UA_REJECTED = (
+    "Дякуємо за заявку 💛\n"
+    "На жаль, цього разу не погоджено 🙏\n\n"
+    "Будемо раді вашим заявкам на інші дати!"
+)
+
 
 # =====================
 # VALIDATION + HELPERS
@@ -113,43 +125,44 @@ PHONE_RE = re.compile(r"^380\d{9}$")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 def is_en(s: str) -> bool:
-    s = (s or "").strip()
+    s = s.strip()
     return bool(s) and bool(EN_TEXT_RE.fullmatch(s))
 
 def is_phone(s: str) -> bool:
-    return bool(PHONE_RE.fullmatch((s or "").strip()))
+    return bool(PHONE_RE.fullmatch(s.strip()))
 
 def is_email(s: str) -> bool:
-    return bool(EMAIL_RE.fullmatch((s or "").strip()))
+    return bool(EMAIL_RE.fullmatch(s.strip()))
 
 def is_next_ua(s: str) -> bool:
-    s = (s or "").strip().lower()
+    s = s.strip().lower()
     return s in {"далі", "дали", "далi", "next"}
 
 def normalize_name_key(name: str) -> str:
-    return re.sub(r"\s+", " ", (name or "").strip()).lower()
+    return re.sub(r"\s+", " ", name.strip()).lower()
 
 def ddmmyyyy_to_mmddyyyy(ddmmyyyy: str) -> str:
     d, m, y = ddmmyyyy.split(".")
     return f"{m}/{d}/{y}"
 
 def mmddyyyy_tab_name(mmddyyyy: str) -> str:
+    # назва вкладки
     return mmddyyyy.replace("/", "-")
 
 def is_dob_ua(text: str) -> bool:
-    return bool(re.fullmatch(r"\d{2}[./]\d{2}[./]\d{4}", (text or "").strip()))
+    return bool(re.fullmatch(r"\d{2}[./]\d{2}[./]\d{4}", text.strip()))
 
 def dob_ua_to_mmddyyyy(text: str) -> str:
-    t = (text or "").strip().replace("/", ".")
+    t = text.strip().replace("/", ".")
     d, m, y = t.split(".")
     return f"{m}/{d}/{y}"
 
-def now_iso() -> str:
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # =====================
-# KEYBOARDS
+# KEYBOARDS (тільки inline, без “постійної кнопки”)
 # =====================
 def kb_begin():
     kb = InlineKeyboardBuilder()
@@ -196,93 +209,108 @@ def kb_more():
 class Form(StatesGroup):
     shoot_date = State()
     shoot_time = State()
-
     model_name = State()
     dob = State()
-
     residence_address = State()
     city = State()
-
     phone = State()
     email = State()
-
     minor = State()
     guardian_name = State()
-
     photo = State()
     consent = State()
 
 
 # =====================
-# GOOGLE AUTH
+# GOOGLE AUTH (SERVICE ACCOUNT only)
 # =====================
 def sa_creds(scopes: list[str]):
-    return ServiceAccountCredentials.from_service_account_file(SA_JSON_PATH, scopes=scopes)
+    return ServiceAccountCredentials.from_service_account_file(SA_JSON, scopes=scopes)
 
 def sheets_client():
-    creds = sa_creds(["https://www.googleapis.com/auth/spreadsheets"])
-    return gspread.authorize(creds)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    return gspread.authorize(sa_creds(scopes))
 
 def drive_service():
-    creds = sa_creds(["https://www.googleapis.com/auth/drive"])
+    scopes = ["https://www.googleapis.com/auth/drive"]
+    creds = sa_creds(scopes)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-def ensure_tab_and_header(sh: gspread.Spreadsheet, shoot_date_mmddyyyy: str):
+def ensure_sheet_tab(shoot_date_mmddyyyy: str):
+    gc = sheets_client()
+    sh = gc.open_by_key(SHEET_ID)
     tab = mmddyyyy_tab_name(shoot_date_mmddyyyy)
+
     try:
         ws = sh.worksheet(tab)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=tab, rows=2000, cols=max(40, len(HEADER) + 5))
+        ws = sh.add_worksheet(title=tab, rows=1000, cols=max(40, len(HEADER) + 5))
         ws.append_row(HEADER)
 
-    # ensure header has required columns (append missing)
-    current = ws.row_values(1)
-    if not current:
-        ws.append_row(HEADER)
-        return ws
+    # Переконуємось, що є всі колонки (якщо вкладка стара)
+    try:
+        existing = ws.row_values(1)
+    except Exception:
+        existing = []
 
-    missing = [h for h in HEADER if h not in current]
-    if missing:
-        ws.append_row([])  # ensure sheet exists
-        new_header = current + missing
-        ws.update("1:1", [new_header])
+    if existing:
+        missing = [h for h in HEADER if h not in existing]
+        if missing:
+            # додамо в кінець
+            ws.update(f"A1:{gspread.utils.rowcol_to_a1(1, len(existing) + len(missing))}",
+                      [existing + missing])
+
+    else:
+        ws.append_row(HEADER)
+
     return ws
 
-def model_exists(ws: gspread.Worksheet, model_name: str) -> bool:
-    # ModelName column index depends on header
+def model_exists_in_tab(ws, model_name: str) -> bool:
+    # ModelName = 6-та колонка у нашому HEADER (1-indexed)
+    # але вкладка могла мати інший заголовок — тому знайдемо індекс по назві
     header = ws.row_values(1)
     if "ModelName" not in header:
         return False
-    idx = header.index("ModelName") + 1
-    col = ws.col_values(idx)
+    col_idx = header.index("ModelName") + 1
+    values = ws.col_values(col_idx)
     key = normalize_name_key(model_name)
-    for v in col[1:]:
+    for v in values[1:]:
         if v and normalize_name_key(v) == key:
             return True
     return False
 
 
 # =====================
-# DRIVE UPLOAD (SERVICE ACCOUNT)
+# DRIVE UPLOAD via Service Account (NO token_drive.json)
 # =====================
 def normalize_filename(shoot_date_ddmmyyyy: str, shoot_time: str, model_name: str, phone: str) -> str:
-    safe_name = re.sub(r"[^A-Za-z0-9]+", "_", (model_name or "").strip()).strip("_")
-    safe_phone = re.sub(r"[^0-9]+", "", (phone or "").strip())
-    safe_time = (shoot_time or "").replace(":", "-")
-    safe_date = (shoot_date_ddmmyyyy or "").replace(".", "-")
+    safe_name = re.sub(r"[^A-Za-z0-9]+", "_", model_name.strip()).strip("_")
+    safe_phone = re.sub(r"[^0-9]+", "", phone.strip())
+    safe_time = shoot_time.replace(":", "-")
+    safe_date = shoot_date_ddmmyyyy.replace(".", "-")
     return f"{safe_date}_{safe_time}_{safe_name}_{safe_phone}.jpg"
 
-async def upload_photo_to_drive_via_sa(bot: Bot, file_id: str, filename: str) -> str:
+async def upload_photo_to_drive(bot: Bot, file_id: str, filename: str) -> str:
+    if not DRIVE_FOLDER_ID:
+        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is empty")
+
     drive = drive_service()
 
     tg_file = await bot.get_file(file_id)
     file_bytes = await bot.download_file(tg_file.file_path)
     data = file_bytes.read()
 
-    media = MediaIoBaseUpload(io.BytesIO(data), mimetype="image/jpeg", resumable=False)
+    media = MediaInMemoryUpload(data, mimetype="image/jpeg", resumable=False)
     metadata = {"name": filename, "parents": [DRIVE_FOLDER_ID]}
-    created = drive.files().create(body=metadata, media_body=media, fields="id,webViewLink").execute()
-    return created["webViewLink"]
+
+    created = drive.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id, webViewLink"
+    ).execute()
+
+    # webViewLink іноді зʼявляється не одразу — але зазвичай ок
+    return created.get("webViewLink") or f"https://drive.google.com/file/d/{created['id']}/view"
 
 
 # =====================
@@ -327,10 +355,8 @@ async def on_model_name(message: Message, state: FSMContext):
     shoot_date_mmddyyyy = ddmmyyyy_to_mmddyyyy(data["shoot_date"])
 
     try:
-        gc = sheets_client()
-        sh = gc.open_by_key(SHEET_ID)
-        ws = ensure_tab_and_header(sh, shoot_date_mmddyyyy)
-        if model_exists(ws, text):
+        ws = ensure_sheet_tab(shoot_date_mmddyyyy)
+        if model_exists_in_tab(ws, text):
             await message.answer(
                 "Схоже, така людина вже подана на цю дату 🙂\n"
                 "Якщо це інша людина з таким самим ім’ям — додайте middle name або ініціал.\n\n"
@@ -338,6 +364,7 @@ async def on_model_name(message: Message, state: FSMContext):
             )
             return
     except Exception:
+        # якщо щось тимчасово з Sheets — не блокуємо користувача
         pass
 
     await state.update_data(model_name=text)
@@ -368,7 +395,7 @@ async def on_dob(message: Message, state: FSMContext):
 async def on_residence_address(message: Message, state: FSMContext):
     text = message.text.strip()
 
-    # Якщо людина пише ДАЛІ — пропускаємо адресу/місто
+    # Якщо ДАЛІ — пропускаємо адресу і місто теж (як ти хотіла)
     if is_next_ua(text):
         await state.update_data(residence_address="", city="")
         await message.answer(
@@ -460,24 +487,16 @@ async def on_photo(message: Message, state: FSMContext, bot: Bot):
         return
 
     data = await state.get_data()
-    for k in ["shoot_date", "shoot_time", "model_name", "phone"]:
-        if not data.get(k):
-            await message.answer("Ой 🙈 анкета перервалася. Почнемо спочатку: /start")
-            await state.clear()
-            return
+    if "shoot_date" not in data or "shoot_time" not in data or "model_name" not in data or "phone" not in data:
+        await message.answer("Ой 🙈 анкета перервалася. Почнемо спочатку: /start")
+        await state.clear()
+        return
 
     filename = normalize_filename(data["shoot_date"], data["shoot_time"], data["model_name"], data["phone"])
     await message.answer("Дякую! 💛 Завантажую фото…")
 
     try:
-        drive_url = await upload_photo_to_drive_via_sa(bot, file_id, filename)
-    except HttpError as e:
-        await message.answer(
-            "Не вдалося завантажити фото в Google Drive 😔\n"
-            "Спробуйте ще раз або напишіть адміну.\n\n"
-            f"Технічна помилка: HttpError ({getattr(e, 'status_code', 'unknown')})"
-        )
-        return
+        drive_url = await upload_photo_to_drive(bot, file_id, filename)
     except Exception as e:
         await message.answer(
             "Не вдалося завантажити фото в Google Drive 😔\n"
@@ -500,19 +519,22 @@ async def on_consent(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
 
     required = ["shoot_date", "shoot_time", "model_name", "dob", "phone", "email", "photo_drive_url"]
-    if any(not data.get(k) for k in required):
-        await call.message.answer("Форма не активна 🙈 Почнемо спочатку: /start")
-        await state.clear()
-        return
+    for k in required:
+        if not data.get(k):
+            await call.message.answer("Форма не активна 🙈 Почнемо спочатку: /start")
+            await state.clear()
+            return
 
     shoot_date_mmddyyyy = ddmmyyyy_to_mmddyyyy(data["shoot_date"])
-    shoot_time = data["shoot_time"].strip()
+    shoot_time_val = data["shoot_time"].strip()
+    guardian = (data.get("guardian_name") or "").strip()
+    city_val = (data.get("city") or "").strip()
+    chat_id = str(call.message.chat.id)
 
-    gc = sheets_client()
-    sh = gc.open_by_key(SHEET_ID)
-    ws = ensure_tab_and_header(sh, shoot_date_mmddyyyy)
+    ws = ensure_sheet_tab(shoot_date_mmddyyyy)
 
-    if model_exists(ws, data["model_name"]):
+    # дублікати імен на ту ж дату
+    if model_exists_in_tab(ws, data["model_name"]):
         await call.message.answer(
             "Схоже, ця людина вже є у списку на цю дату 🙂\n"
             "Якщо це інша людина з таким самим ім’ям — подайте ще раз з middle name/ініціалом.\n\n"
@@ -522,34 +544,32 @@ async def on_consent(call: CallbackQuery, state: FSMContext):
         await state.clear()
         return
 
-    guardian = (data.get("guardian_name") or "").strip()
-    city_val = (data.get("city") or "").strip()
-
     row = [
-        NAMEPRINT_CONST,                 # Nameprint
-        shoot_date_mmddyyyy,             # DateSigned (== day)
-        shoot_date_mmddyyyy,             # ShootDate (== day)
-        shoot_time,                      # ShootTime
-        SHOOTPLACE_CONST,                # ShootPlace
-        SHOOTSTATE_CONST,                # ShootState
-        data["model_name"].strip(),      # ModelName
-        data["dob"].strip(),             # DateOfBirth (mm/dd/yyyy)
+        NAMEPRINT_CONST,                   # Nameprint
+        shoot_date_mmddyyyy,               # DateSigned (як день зйомки)
+        shoot_date_mmddyyyy,               # ShootDate
+        SHOOTPLACE_CONST,                  # ShootPlace
+        SHOOTSTATE_CONST,                  # ShootState
+        data["model_name"].strip(),        # ModelName
+        data["dob"].strip(),               # DateOfBirth
         (data.get("residence_address") or "").strip(),  # ResidenceAddress
-        city_val,                        # City
-        "",                              # State
-        COUNTRY_CONST,                   # Country
-        "",                              # ZipCode
-        data["phone"].strip(),           # Phone
-        data["email"].strip(),           # Email
-        guardian,                        # GuardianName
-        shoot_date_mmddyyyy,             # DateSigneded
-        data["photo_drive_url"].strip(), # Photo
-        str(call.from_user.id),          # TelegramChatId
-        STATUS_DEFAULT,                  # Status
-        "",                              # NotifiedAt
+        city_val,                          # City
+        "",                                # State (не питаємо)
+        COUNTRY_CONST,                     # Country (константа)
+        "",                                # ZipCode (не питаємо)
+        data["phone"].strip(),             # Phone
+        data["email"].strip(),             # Email
+        guardian,                          # GuardianName
+        shoot_date_mmddyyyy,               # DateSigneded
+        data["photo_drive_url"].strip(),   # Photo
+        shoot_time_val,                    # ShootTime (НОВЕ)
+        chat_id,                           # TelegramChatId (НОВЕ)
+        "",                                # Status (менеджер заповнить)
+        "",                                # NotifiedAt (бот заповнить після повідомлення)
     ]
 
     ws.append_row(row)
+
     await call.message.answer(UA_FINISH, reply_markup=kb_more())
     await state.clear()
 
@@ -566,16 +586,78 @@ async def on_more(call: CallbackQuery, state: FSMContext):
         await call.message.answer("Готово 💛 Гарного дня! Якщо що — просто напишіть /start")
 
 
+# =====================
+# MANAGER NOTIFICATIONS (poll Sheets -> send msg)
+# =====================
+async def notifier_loop(bot: Bot):
+    # раз на хвилину перевіряємо всі вкладки дат і шлемо повідомлення тим,
+    # у кого є Status і пустий NotifiedAt
+    await asyncio.sleep(5)
+    while True:
+        try:
+            for ddmmyyyy in DATES:
+                shoot_mmddyyyy = ddmmyyyy_to_mmddyyyy(ddmmyyyy)
+                ws = ensure_sheet_tab(shoot_mmddyyyy)
+
+                header = ws.row_values(1)
+                def idx(col_name: str):
+                    return header.index(col_name) + 1 if col_name in header else None
+
+                i_chat = idx("TelegramChatId")
+                i_status = idx("Status")
+                i_notif = idx("NotifiedAt")
+
+                if not (i_chat and i_status and i_notif):
+                    continue
+
+                # читаємо все одним разом (може бути багато, але у нас невеликі вкладки)
+                rows = ws.get_all_values()
+                if len(rows) <= 1:
+                    continue
+
+                for r_i in range(2, len(rows) + 1):  # 1 = header
+                    row = rows[r_i - 1]
+                    status = (row[i_status - 1] if len(row) >= i_status else "").strip()
+                    chat_id = (row[i_chat - 1] if len(row) >= i_chat else "").strip()
+                    notified = (row[i_notif - 1] if len(row) >= i_notif else "").strip()
+
+                    if not chat_id or notified or not status:
+                        continue
+
+                    st = status.strip().lower()
+                    if st == STATUS_APPROVED.lower():
+                        text = UA_APPROVED
+                    elif st == STATUS_REJECTED.lower():
+                        text = UA_REJECTED
+                    else:
+                        # менеджер може писати щось інше — тоді не чіпаємо
+                        continue
+
+                    try:
+                        await bot.send_message(int(chat_id), text)
+                        ws.update_cell(r_i, i_notif, utc_now_iso())
+                    except Exception:
+                        # якщо людина заблокувала бота або телеграм не доступний — не падаємо
+                        ws.update_cell(r_i, i_notif, "FAILED_TO_NOTIFY")
+        except Exception:
+            # будь-яка проблема з Google API — просто спробуємо ще раз пізніше
+            pass
+
+        await asyncio.sleep(60)
+
+
+# =====================
+# MAIN
+# =====================
 async def main():
-    # Мінімальні перевірки
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is empty (set Railway Variables)")
+        raise RuntimeError("BOT_TOKEN is empty in .env / Railway Variables")
     if not SHEET_ID:
-        raise RuntimeError("GOOGLE_SHEET_ID is empty (set Railway Variables)")
+        raise RuntimeError("GOOGLE_SHEET_ID is empty in .env / Railway Variables")
     if not DRIVE_FOLDER_ID:
-        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is empty (set Railway Variables)")
-    if not os.path.exists(SA_JSON_PATH):
-        raise RuntimeError("service_account.json not found (did init_secrets.py create it?)")
+        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is empty in .env / Railway Variables")
+    if not os.path.exists(SA_JSON):
+        raise RuntimeError("service_account.json not found (check init_secrets + SERVICE_ACCOUNT_JSON_B64)")
 
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
@@ -602,6 +684,9 @@ async def main():
     dp.callback_query.register(on_consent, F.data == "consent:yes", Form.consent)
 
     dp.callback_query.register(on_more, F.data.startswith("more:"))
+
+    # запустимо менеджерські нотифікації паралельно
+    asyncio.create_task(notifier_loop(bot))
 
     await dp.start_polling(bot)
 
