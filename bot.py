@@ -1,6 +1,10 @@
 import os
 import re
+import io
+import json
+import base64
 import asyncio
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
@@ -15,17 +19,20 @@ import gspread
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaInMemoryUpload
+from googleapiclient.http import MediaIoBaseUpload
 
 
 # =====================
 # ENV
 # =====================
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
-SA_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "service_account.json")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
+DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
+
+# Якщо на Railway ти зберігаєш base64 секрети — код сам створить service_account.json
+SERVICE_ACCOUNT_JSON_B64 = os.getenv("SERVICE_ACCOUNT_JSON_B64", "").strip()
+SA_JSON_PATH = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "service_account.json").strip()
 
 
 # =====================
@@ -48,7 +55,7 @@ SHOOTPLACE_CONST = "Ukraine"
 SHOOTSTATE_CONST = "Kyiv"
 COUNTRY_CONST = "Ukraine"
 
-# ДОДАЛИ ShootTime (важливо для груп)
+# Додаємо ShootTime (важливо для груп)
 HEADER = [
     "Nameprint",
     "DateSigned",
@@ -76,15 +83,14 @@ HEADER = [
 # =====================
 UA_INTRO = (
     "Привіт! 👋💛\n\n"
-    "Тут ви можете податись на фотозйомку.\n"
-    "Я поставлю кілька запитань — це потрібно лише для оформлення модельного релізу.\n\n"
+    "Тут можна податись на фотозйомку.\n"
+    "Я поставлю кілька питань — це потрібно для оформлення модельного релізу.\n\n"
     "Важливо:\n"
     "• Всі текстові відповіді (імʼя, місто, адреса, email) — англійською\n"
     "• Телефон — тільки цифри у форматі 380931111111\n"
-    "• Адреса (вулиця/будинок) — необовʼязкова: якщо не хочете — напишіть ДАЛІ\n\n"
+    "• Адреса (вулиця/будинок) — необовʼязкова, можна написати ДАЛІ\n\n"
     "До речі, можна приходити з родичами — будемо раді всім 😊"
 )
-
 UA_READY = "Коли будете готові — натисніть кнопку нижче 👇"
 
 UA_FINISH = (
@@ -102,7 +108,6 @@ UA_FINISH = (
 EN_TEXT_RE = re.compile(r"^[A-Za-z0-9\s\-\.'\,/#]+$")
 PHONE_RE = re.compile(r"^380\d{9}$")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-ZIP_RE = re.compile(r"^\d{4,10}$")
 
 def is_en(s: str) -> bool:
     s = s.strip()
@@ -113,9 +118,6 @@ def is_phone(s: str) -> bool:
 
 def is_email(s: str) -> bool:
     return bool(EMAIL_RE.fullmatch(s.strip()))
-
-def is_zip(s: str) -> bool:
-    return bool(ZIP_RE.fullmatch(s.strip()))
 
 def is_next_ua(s: str) -> bool:
     s = s.strip().lower()
@@ -129,6 +131,7 @@ def ddmmyyyy_to_mmddyyyy(ddmmyyyy: str) -> str:
     return f"{m}/{d}/{y}"
 
 def mmddyyyy_tab_name(mmddyyyy: str) -> str:
+    # назва вкладки як 01-10-2026
     return mmddyyyy.replace("/", "-")
 
 def is_dob_ua(text: str) -> bool:
@@ -139,12 +142,30 @@ def dob_ua_to_mmddyyyy(text: str) -> str:
     d, m, y = t.split(".")
     return f"{m}/{d}/{y}"
 
-def missing_required(data: dict, keys: list[str]) -> bool:
-    return any(k not in data or data.get(k) is None for k in keys)
+def ensure_service_account_json():
+    """
+    Якщо на Railway немає service_account.json (бо він у .gitignore) —
+    створюємо його з SERVICE_ACCOUNT_JSON_B64.
+    """
+    if os.path.exists(SA_JSON_PATH):
+        return
+    if not SERVICE_ACCOUNT_JSON_B64:
+        return
+    raw = base64.b64decode(SERVICE_ACCOUNT_JSON_B64.encode("utf-8"))
+    with open(SA_JSON_PATH, "wb") as f:
+        f.write(raw)
+
+def get_sa_client_email() -> str:
+    try:
+        with open(SA_JSON_PATH, "r", encoding="utf-8") as f:
+            j = json.load(f)
+        return j.get("client_email", "")
+    except Exception:
+        return ""
 
 
 # =====================
-# KEYBOARDS
+# KEYBOARDS (INLINE, без “постійних” кнопок внизу)
 # =====================
 def kb_begin():
     kb = InlineKeyboardBuilder()
@@ -209,10 +230,10 @@ class Form(StatesGroup):
 
 
 # =====================
-# GOOGLE AUTH (Service Account)
+# GOOGLE (Service Account: Sheets + Drive)
 # =====================
 def sa_creds(scopes: list[str]):
-    return ServiceAccountCredentials.from_service_account_file(SA_JSON, scopes=scopes)
+    return ServiceAccountCredentials.from_service_account_file(SA_JSON_PATH, scopes=scopes)
 
 def sheets_client():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -220,27 +241,37 @@ def sheets_client():
 
 def drive_service():
     scopes = ["https://www.googleapis.com/auth/drive"]
-    creds = sa_creds(scopes)
-    return build("drive", "v3", credentials=creds)
+    return build("drive", "v3", credentials=sa_creds(scopes))
 
-def ensure_sheet_tab(sheet_id: str, shoot_date_mmddyyyy: str):
+def ensure_sheet_tab(sh_id: str, shoot_date_mmddyyyy: str):
     gc = sheets_client()
-    sh = gc.open_by_key(sheet_id)
+    sh = gc.open_by_key(sh_id)
     tab = mmddyyyy_tab_name(shoot_date_mmddyyyy)
     try:
         ws = sh.worksheet(tab)
-        # якщо вкладка була створена старою версією — переконаємось що header має ShootTime
-        head = ws.row_values(1)
-        if head and "ShootTime" not in head:
-            ws.update("A1", [HEADER])
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=tab, rows=1000, cols=40)
+    except Exception:
+        ws = sh.add_worksheet(title=tab, rows=1000, cols=60)
         ws.append_row(HEADER)
+        return ws
+
+    # Якщо вкладка існує, але заголовок ще старий — “дотягнемо” HEADER
+    try:
+        first_row = ws.row_values(1)
+        if not first_row:
+            ws.append_row(HEADER)
+        else:
+            # якщо не вистачає колонок — дописуємо справа
+            if len(first_row) < len(HEADER):
+                ws.update("1:1", [HEADER])
+    except Exception:
+        pass
+
     return ws
 
 def model_exists_in_tab(ws, model_name: str) -> bool:
     try:
-        col = ws.col_values(7)  # ModelName = 7-ма колонка в HEADER (1-indexed)
+        # ModelName — 7 колонка (1-based), тобто індекс 7
+        col = ws.col_values(7)
     except Exception:
         return False
     key = normalize_name_key(model_name)
@@ -251,7 +282,7 @@ def model_exists_in_tab(ws, model_name: str) -> bool:
 
 
 # =====================
-# DRIVE UPLOAD (Service Account)
+# DRIVE UPLOAD
 # =====================
 def normalize_filename(shoot_date_ddmmyyyy: str, shoot_time: str, model_name: str, phone: str) -> str:
     safe_name = re.sub(r"[^A-Za-z0-9]+", "_", model_name.strip()).strip("_")
@@ -260,22 +291,39 @@ def normalize_filename(shoot_date_ddmmyyyy: str, shoot_time: str, model_name: st
     safe_date = shoot_date_ddmmyyyy.replace(".", "-")
     return f"{safe_date}_{safe_time}_{safe_name}_{safe_phone}.jpg"
 
-async def upload_photo_to_drive_sa(bot: Bot, file_id: str, filename: str) -> str:
+async def upload_photo_to_drive_via_sa(bot: Bot, file_id: str, filename: str) -> str:
+    """
+    Завантажує файл у DRIVE_FOLDER_ID через service account.
+    Повертає webViewLink.
+    """
     drive = drive_service()
 
     tg_file = await bot.get_file(file_id)
     file_bytes = await bot.download_file(tg_file.file_path)
     data = file_bytes.read()
 
-    media = MediaInMemoryUpload(data, mimetype="image/jpeg", resumable=False)
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype="image/jpeg", resumable=False)
     metadata = {"name": filename, "parents": [DRIVE_FOLDER_ID]}
+
     created = drive.files().create(
         body=metadata,
         media_body=media,
         fields="id, webViewLink"
     ).execute()
 
-    return created.get("webViewLink") or f"https://drive.google.com/file/d/{created['id']}/view"
+    file_id_created = created["id"]
+
+    # Робимо “Anyone with the link can view” (щоб менеджеру/скрипту було зручно)
+    # Якщо у вас політика інша — скажи, і я приберу.
+    drive.permissions().create(
+        fileId=file_id_created,
+        body={"type": "anyone", "role": "reader"},
+        fields="id"
+    ).execute()
+
+    # Після permission webViewLink інколи треба ще раз запросити
+    created2 = drive.files().get(fileId=file_id_created, fields="webViewLink").execute()
+    return created2["webViewLink"]
 
 
 # =====================
@@ -318,18 +366,14 @@ async def on_model_name(message: Message, state: FSMContext):
 
     data = await state.get_data()
     shoot_date_mmddyyyy = ddmmyyyy_to_mmddyyyy(data["shoot_date"])
-
-    try:
-        ws = ensure_sheet_tab(SHEET_ID, shoot_date_mmddyyyy)
-        if model_exists_in_tab(ws, text):
-            await message.answer(
-                "Схоже, така людина вже подана на цю дату 🙂\n"
-                "Якщо це інша людина з таким самим ім’ям — додайте middle name або ініціал.\n\n"
-                "Спробуйте ще раз, будь ласка 💛"
-            )
-            return
-    except Exception:
-        pass
+    ws = ensure_sheet_tab(SHEET_ID, shoot_date_mmddyyyy)
+    if model_exists_in_tab(ws, text):
+        await message.answer(
+            "Схоже, така людина вже подана на цю дату 🙂\n"
+            "Якщо це інша людина з таким самим ім’ям — додайте middle name або ініціал.\n\n"
+            "Спробуйте ще раз, будь ласка 💛"
+        )
+        return
 
     await state.update_data(model_name=text)
     await message.answer(
@@ -359,7 +403,7 @@ async def on_dob(message: Message, state: FSMContext):
 async def on_residence_address(message: Message, state: FSMContext):
     text = message.text.strip()
 
-    # Якщо ДАЛІ — пропускаємо адресу/місто/область/індекс одразу
+    # Якщо людина пише ДАЛІ — пропускаємо адресу/місто одразу
     if is_next_ua(text):
         await state.update_data(residence_address="", city="")
         await message.answer(
@@ -452,7 +496,7 @@ async def on_photo(message: Message, state: FSMContext, bot: Bot):
 
     data = await state.get_data()
     required = ["shoot_date", "shoot_time", "model_name", "phone"]
-    if missing_required(data, required):
+    if any(k not in data or not data.get(k) for k in required):
         await message.answer("Ой 🙈 анкета перервалася. Почнемо спочатку: /start")
         await state.clear()
         return
@@ -461,7 +505,7 @@ async def on_photo(message: Message, state: FSMContext, bot: Bot):
     await message.answer("Дякую! 💛 Завантажую фото…")
 
     try:
-        drive_url = await upload_photo_to_drive_sa(bot, file_id, filename)
+        drive_url = await upload_photo_to_drive_via_sa(bot, file_id, filename)
     except Exception as e:
         await message.answer(
             "Не вдалося завантажити фото в Google Drive 😔\n"
@@ -484,19 +528,15 @@ async def on_consent(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
 
     required = ["shoot_date", "shoot_time", "model_name", "dob", "phone", "email", "photo_drive_url"]
-    if missing_required(data, required):
+    if any(k not in data or not data.get(k) for k in required):
         await call.message.answer("Форма не активна 🙈 Почнемо спочатку: /start")
         await state.clear()
         return
 
     shoot_date_mmddyyyy = ddmmyyyy_to_mmddyyyy(data["shoot_date"])
-    shoot_time = data["shoot_time"].strip()
-
-    guardian = (data.get("guardian_name") or "").strip()
-    city_val = (data.get("city") or "").strip()
-
     ws = ensure_sheet_tab(SHEET_ID, shoot_date_mmddyyyy)
 
+    # дубль-guard
     if model_exists_in_tab(ws, data["model_name"]):
         await call.message.answer(
             "Схоже, ця людина вже є у списку на цю дату 🙂\n"
@@ -507,11 +547,14 @@ async def on_consent(call: CallbackQuery, state: FSMContext):
         await state.clear()
         return
 
+    guardian = (data.get("guardian_name") or "").strip()
+    city_val = (data.get("city") or "").strip()
+
     row = [
         NAMEPRINT_CONST,
         shoot_date_mmddyyyy,
         shoot_date_mmddyyyy,
-        shoot_time,
+        data["shoot_time"].strip(),
         SHOOTPLACE_CONST,
         SHOOTSTATE_CONST,
         data["model_name"].strip(),
@@ -547,14 +590,16 @@ async def on_more(call: CallbackQuery, state: FSMContext):
 
 
 async def main():
+    ensure_service_account_json()
+
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is empty (set Railway Variable BOT_TOKEN)")
+        raise RuntimeError("BOT_TOKEN is empty")
     if not SHEET_ID:
-        raise RuntimeError("GOOGLE_SHEET_ID is empty (set Railway Variable GOOGLE_SHEET_ID)")
+        raise RuntimeError("GOOGLE_SHEET_ID is empty")
     if not DRIVE_FOLDER_ID:
-        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is empty (set Railway Variable GOOGLE_DRIVE_FOLDER_ID)")
-    if not os.path.exists(SA_JSON):
-        raise RuntimeError("service_account.json not found (make sure init_secrets.py creates it on Railway)")
+        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is empty")
+    if not os.path.exists(SA_JSON_PATH):
+        raise RuntimeError("service_account.json not found (set SERVICE_ACCOUNT_JSON_B64 in Railway Variables)")
 
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
