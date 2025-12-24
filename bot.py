@@ -1,5 +1,6 @@
 import os
 import re
+import io
 import json
 import base64
 import asyncio
@@ -18,6 +19,7 @@ from google.oauth2.service_account import Credentials as ServiceAccountCredentia
 
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload
+from googleapiclient.errors import HttpError
 
 
 # =====================
@@ -25,12 +27,12 @@ from googleapiclient.http import MediaInMemoryUpload
 # =====================
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
-DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 
-# ВАРІАНТ 1: тільки Service Account base64 (без файлів на диску)
-SERVICE_ACCOUNT_JSON_B64 = os.getenv("SERVICE_ACCOUNT_JSON_B64", "").strip()
+# base64(service_account.json) in Railway Variables
+SA_JSON_B64 = os.getenv("SERVICE_ACCOUNT_JSON_B64")
 
 
 # =====================
@@ -53,12 +55,10 @@ SHOOTPLACE_CONST = "Ukraine"
 SHOOTSTATE_CONST = "Kyiv"
 COUNTRY_CONST = "Ukraine"
 
-# Додаємо ShootTime + менеджерські поля в кінець:
 HEADER = [
     "Nameprint",
     "DateSigned",
     "ShootDate",
-    "ShootTime",
     "ShootPlace",
     "ShootState",
     "ModelName",
@@ -73,9 +73,8 @@ HEADER = [
     "GuardianName",
     "DateSigneded",
     "Photo",
-    "TelegramChatId",
-    "Status",
-    "NotifiedAt",
+    # додатково під групи:
+    "ShootTime",
 ]
 
 
@@ -85,12 +84,12 @@ HEADER = [
 UA_INTRO = (
     "Привіт! 👋💛\n\n"
     "Тут ви можете податись на фотозйомку.\n"
-    "Я поставлю кілька запитань — це потрібно лише для оформлення модельного релізу.\n\n"
+    "Я поставлю кілька запитань — це потрібно для оформлення модельного релізу.\n\n"
     "Важливо:\n"
     "• Всі текстові відповіді (імʼя, місто, адреса, email) — англійською\n"
     "• Телефон — тільки цифри у форматі 380931111111\n"
     "• Адреса (вулиця/будинок) — необовʼязкова, можна написати ДАЛІ\n\n"
-    "До речі, можна приходити з родичами — будемо раді всім 😊"
+    "Можна подавати кількох людей — наприкінці буде кнопка ✨"
 )
 
 UA_READY = "Коли будете готові — натисніть кнопку нижче 👇"
@@ -213,69 +212,46 @@ class Form(StatesGroup):
 
 
 # =====================
-# GOOGLE AUTH (Service Account only)
+# GOOGLE (Service Account, base64)
 # =====================
 def _service_account_info() -> dict:
-    if not SERVICE_ACCOUNT_JSON_B64:
-        raise RuntimeError("SERVICE_ACCOUNT_JSON_B64 is empty (set it in Railway Variables)")
-    try:
-        raw = base64.b64decode(SERVICE_ACCOUNT_JSON_B64).decode("utf-8")
-        return json.loads(raw)
-    except Exception as e:
-        raise RuntimeError(f"Failed to decode SERVICE_ACCOUNT_JSON_B64: {type(e).__name__}")
+    if not SA_JSON_B64:
+        raise RuntimeError("SERVICE_ACCOUNT_JSON_B64 is empty in Railway Variables")
+    raw = base64.b64decode(SA_JSON_B64)
+    return json.loads(raw.decode("utf-8"))
 
-def sheets_client() -> gspread.Client:
-    info = _service_account_info()
+def sheets_client():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = ServiceAccountCredentials.from_service_account_info(info, scopes=scopes)
+    creds = ServiceAccountCredentials.from_service_account_info(_service_account_info(), scopes=scopes)
     return gspread.authorize(creds)
 
 def drive_service():
-    info = _service_account_info()
+    # drive scope потрібен щоб створювати файли в папці
     scopes = ["https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_service_account_info(info, scopes=scopes)
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+    creds = ServiceAccountCredentials.from_service_account_info(_service_account_info(), scopes=scopes)
+    return build("drive", "v3", credentials=creds)
 
-def ensure_header(ws):
-    """If sheet is empty -> write header. If header exists but missing columns -> append them."""
-    try:
-        first_row = ws.row_values(1)
-    except Exception:
-        first_row = []
-
-    if not first_row:
-        ws.append_row(HEADER)
-        return
-
-    missing = [h for h in HEADER if h not in first_row]
-    if missing:
-        new_header = first_row + missing
-        ws.update("1:1", [new_header])
-
-def ensure_sheet_tab(sheet_id: str, shoot_date_mmddyyyy: str):
-    gc = sheets_client()
-    sh = gc.open_by_key(sheet_id)
+def ensure_sheet_tab(sh, shoot_date_mmddyyyy: str):
     tab = mmddyyyy_tab_name(shoot_date_mmddyyyy)
     try:
         ws = sh.worksheet(tab)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=tab, rows=1000, cols=max(40, len(HEADER) + 10))
-    ensure_header(ws)
+    except Exception:
+        ws = sh.add_worksheet(title=tab, rows=1000, cols=60)
+        ws.append_row(HEADER)
+    # якщо раптом вкладка була створена раніше без ShootTime — додамо в кінець
+    try:
+        existing = ws.row_values(1)
+        if "ShootTime" not in existing:
+            ws.update_cell(1, len(existing) + 1, "ShootTime")
+    except Exception:
+        pass
     return ws
 
 def model_exists_in_tab(ws, model_name: str) -> bool:
-    # ModelName column index in our HEADER (1-based): find by header name dynamically
-    header = ws.row_values(1)
     try:
-        idx = header.index("ModelName") + 1
-    except ValueError:
-        return False
-
-    try:
-        col = ws.col_values(idx)
+        col = ws.col_values(6)  # ModelName
     except Exception:
         return False
-
     key = normalize_name_key(model_name)
     for v in col[1:]:
         if v and normalize_name_key(v) == key:
@@ -293,9 +269,9 @@ def normalize_filename(shoot_date_ddmmyyyy: str, shoot_time: str, model_name: st
     safe_date = shoot_date_ddmmyyyy.replace(".", "-")
     return f"{safe_date}_{safe_time}_{safe_name}_{safe_phone}.jpg"
 
-async def upload_photo_to_drive_via_sa(bot: Bot, file_id: str, filename: str) -> str:
+async def upload_photo_to_drive(bot: Bot, file_id: str, filename: str) -> str:
     if not DRIVE_FOLDER_ID:
-        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is empty")
+        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is empty in Railway Variables")
 
     drive = drive_service()
 
@@ -306,13 +282,26 @@ async def upload_photo_to_drive_via_sa(bot: Bot, file_id: str, filename: str) ->
     media = MediaInMemoryUpload(data, mimetype="image/jpeg", resumable=False)
     metadata = {"name": filename, "parents": [DRIVE_FOLDER_ID]}
 
-    created = drive.files().create(
-        body=metadata,
-        media_body=media,
-        fields="id,webViewLink"
-    ).execute()
+    try:
+        created = drive.files().create(
+            body=metadata,
+            media_body=media,
+            fields="id, webViewLink"
+        ).execute()
+    except HttpError as e:
+        # покажемо максимально корисно, щоб ти бачила реальну причину
+        details = ""
+        try:
+            details = e.content.decode("utf-8", errors="ignore")
+        except Exception:
+            details = str(e)
 
-    # Link can be empty if permissions are restrictive; still we save id if needed.
+        raise RuntimeError(
+            "Google Drive відхилив завантаження. "
+            "Перевір: папка пошарена на service-account email як Editor, і Drive API увімкнений. "
+            f"HttpError {getattr(e, 'status_code', '')}: {details[:400]}"
+        )
+
     return created.get("webViewLink") or f"https://drive.google.com/file/d/{created['id']}/view"
 
 
@@ -358,7 +347,9 @@ async def on_model_name(message: Message, state: FSMContext):
     shoot_date_mmddyyyy = ddmmyyyy_to_mmddyyyy(data["shoot_date"])
 
     try:
-        ws = ensure_sheet_tab(SHEET_ID, shoot_date_mmddyyyy)
+        gc = sheets_client()
+        sh = gc.open_by_key(SHEET_ID)
+        ws = ensure_sheet_tab(sh, shoot_date_mmddyyyy)
         if model_exists_in_tab(ws, text):
             await message.answer(
                 "Схоже, така людина вже подана на цю дату 🙂\n"
@@ -397,7 +388,6 @@ async def on_dob(message: Message, state: FSMContext):
 async def on_residence_address(message: Message, state: FSMContext):
     text = message.text.strip()
 
-    # Якщо людина пише ДАЛІ — пропускаємо адресу/місто/область/індекс одразу
     if is_next_ua(text):
         await state.update_data(residence_address="", city="")
         await message.answer(
@@ -499,12 +489,12 @@ async def on_photo(message: Message, state: FSMContext, bot: Bot):
     await message.answer("Дякую! 💛 Завантажую фото…")
 
     try:
-        drive_url = await upload_photo_to_drive_via_sa(bot, file_id, filename)
+        drive_url = await upload_photo_to_drive(bot, file_id, filename)
     except Exception as e:
         await message.answer(
             "Не вдалося завантажити фото в Google Drive 😔\n"
             "Спробуйте ще раз або напишіть адміну.\n\n"
-            f"Технічна помилка: {type(e).__name__}"
+            f"Технічна помилка: {type(e).__name__}\n{str(e)[:300]}"
         )
         return
 
@@ -530,11 +520,11 @@ async def on_consent(call: CallbackQuery, state: FSMContext):
     shoot_date_mmddyyyy = ddmmyyyy_to_mmddyyyy(data["shoot_date"])
     guardian = (data.get("guardian_name") or "").strip()
     city_val = (data.get("city") or "").strip()
-    chat_id = str(call.message.chat.id)
 
-    ws = ensure_sheet_tab(SHEET_ID, shoot_date_mmddyyyy)
+    gc = sheets_client()
+    sh = gc.open_by_key(SHEET_ID)
+    ws = ensure_sheet_tab(sh, shoot_date_mmddyyyy)
 
-    # Перевірка на дубль
     if model_exists_in_tab(ws, data["model_name"]):
         await call.message.answer(
             "Схоже, ця людина вже є у списку на цю дату 🙂\n"
@@ -547,9 +537,8 @@ async def on_consent(call: CallbackQuery, state: FSMContext):
 
     row = [
         NAMEPRINT_CONST,
-        shoot_date_mmddyyyy,                 # DateSigned
-        shoot_date_mmddyyyy,                 # ShootDate
-        data["shoot_time"].strip(),          # ShootTime
+        shoot_date_mmddyyyy,
+        shoot_date_mmddyyyy,
         SHOOTPLACE_CONST,
         SHOOTSTATE_CONST,
         data["model_name"].strip(),
@@ -562,11 +551,9 @@ async def on_consent(call: CallbackQuery, state: FSMContext):
         data["phone"].strip(),
         data["email"].strip(),
         guardian,
-        shoot_date_mmddyyyy,                 # DateSigneded
+        shoot_date_mmddyyyy,
         data["photo_drive_url"].strip(),
-        chat_id,                             # TelegramChatId
-        "pending",                           # Status
-        "",                                  # NotifiedAt
+        data["shoot_time"].strip(),  # ShootTime
     ]
 
     ws.append_row(row)
@@ -589,13 +576,13 @@ async def on_more(call: CallbackQuery, state: FSMContext):
 
 async def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is empty")
+        raise RuntimeError("BOT_TOKEN is empty in Railway Variables")
     if not SHEET_ID:
-        raise RuntimeError("GOOGLE_SHEET_ID is empty")
+        raise RuntimeError("GOOGLE_SHEET_ID is empty in Railway Variables")
     if not DRIVE_FOLDER_ID:
-        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is empty")
-    if not SERVICE_ACCOUNT_JSON_B64:
-        raise RuntimeError("SERVICE_ACCOUNT_JSON_B64 is empty")
+        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is empty in Railway Variables")
+    if not SA_JSON_B64:
+        raise RuntimeError("SERVICE_ACCOUNT_JSON_B64 is empty in Railway Variables")
 
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
