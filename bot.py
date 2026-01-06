@@ -28,10 +28,10 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")  # folder ID (може починатися з 0AF... для Shared Drive)
+DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")  # може починатися з 0AF... для Shared Drive
 SERVICE_ACCOUNT_JSON_B64 = os.getenv("SERVICE_ACCOUNT_JSON_B64")  # base64(service_account.json)
 
-STATUS_CHECK_INTERVAL_SEC = int(os.getenv("STATUS_CHECK_INTERVAL_SEC", "20"))  # як часто перевіряти статуси
+STATUS_CHECK_INTERVAL_SEC = int(os.getenv("STATUS_CHECK_INTERVAL_SEC", "20"))
 
 
 # =====================
@@ -56,9 +56,6 @@ SHOOTPLACE_CONST = "Ukraine"
 SHOOTSTATE_CONST = "Kyiv"
 COUNTRY_CONST = "Ukraine"
 
-TZ_KYIV = ZoneInfo("Europe/Kyiv")
-
-# ГОЛОВНЕ: заголовки таблиці (в кожній вкладці-дні)
 HEADER = [
     "Nameprint",
     "DateSigned",
@@ -86,7 +83,7 @@ HEADER = [
 
 
 # =====================
-# TEXTS (милі)
+# TEXTS
 # =====================
 UA_INTRO = (
     "Привіт! 👋💛\n\n"
@@ -102,7 +99,6 @@ UA_INTRO = (
     "• Адреса проживання необовʼязкова — менеджер зможе уточнити це пізніше 💛\n\n"
     "До речі, можна приходити з родичами — будемо раді всім 😊"
 )
-
 UA_READY = "Коли будете готові — натисніть кнопку нижче 👇"
 
 UA_FINISH = (
@@ -125,6 +121,21 @@ REJECTED_TEXT = (
     "Дякуємо, що подались 💛 Якщо з’являться нові слоти — ми напишемо."
 )
 
+# Локація тільки для 01/10/2026 та 01/11/2026 (MM/DD/YYYY у таблиці)
+LOCATION_DATES_MMDDYYYY = {"01/10/2026", "01/11/2026"}
+
+APPROVED_LOCATION_10_11 = (
+    "\n\n"
+    "📍 **Локація зйомки**\n"
+    "Архітектурно-інженерний колегіум А+\n"
+    "(м.Нивки ЖК Файна Таун)\n"
+    "https://maps.app.goo.gl/gngnhGf3BgoLLaLS8\n\n"
+    "⏰ **Приходьте вчасно**\n"
+    "Точка збору для моделей: перед входом в школу.\n"
+    "Чекаємо, поки вас забере ваш адміністратор.\n"
+    "Самостійно не заходимо 💛"
+)
+
 
 # =====================
 # VALIDATION + HELPERS
@@ -132,27 +143,23 @@ REJECTED_TEXT = (
 EN_TEXT_RE = re.compile(r"^[A-Za-z0-9\s\-\.'\,/#]+$")
 PHONE_RE = re.compile(r"^380\d{9}$")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-ZIP_RE = re.compile(r"^\d{4,10}$")
 
 def is_en(s: str) -> bool:
-    s = s.strip()
+    s = (s or "").strip()
     return bool(s) and bool(EN_TEXT_RE.fullmatch(s))
 
 def is_phone(s: str) -> bool:
-    return bool(PHONE_RE.fullmatch(s.strip()))
+    return bool(PHONE_RE.fullmatch((s or "").strip()))
 
 def is_email(s: str) -> bool:
-    return bool(EMAIL_RE.fullmatch(s.strip()))
-
-def is_zip(s: str) -> bool:
-    return bool(ZIP_RE.fullmatch(s.strip()))
+    return bool(EMAIL_RE.fullmatch((s or "").strip()))
 
 def is_next_ua(s: str) -> bool:
-    s = s.strip().lower()
+    s = (s or "").strip().lower()
     return s in {"далі", "дали", "далi", "next"}
 
 def normalize_name_key(name: str) -> str:
-    return re.sub(r"\s+", " ", name.strip()).lower()
+    return re.sub(r"\s+", " ", (name or "").strip()).lower()
 
 def ddmmyyyy_to_mmddyyyy(ddmmyyyy: str) -> str:
     d, m, y = ddmmyyyy.split(".")
@@ -162,10 +169,10 @@ def mmddyyyy_tab_name(mmddyyyy: str) -> str:
     return mmddyyyy.replace("/", "-")
 
 def is_dob_ua(text: str) -> bool:
-    return bool(re.fullmatch(r"\d{2}[./]\d{2}[./]\d{4}", text.strip()))
+    return bool(re.fullmatch(r"\d{2}[./]\d{2}[./]\d{4}", (text or "").strip()))
 
 def dob_ua_to_mmddyyyy(text: str) -> str:
-    t = text.strip().replace("/", ".")
+    t = (text or "").strip().replace("/", ".")
     d, m, y = t.split(".")
     return f"{m}/{d}/{y}"
 
@@ -175,15 +182,17 @@ def missing_required(data: dict, keys: list[str]) -> bool:
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def now_submitted_kv() -> str:
-    return datetime.now(TZ_KYIV).strftime("%m/%d/%Y %H:%M")
+def safe_lower(s: str) -> str:
+    return (s or "").strip().lower()
+
+def kyiv_submitted_at() -> str:
+    return datetime.now(ZoneInfo("Europe/Kyiv")).strftime("%m/%d/%Y %H:%M")
 
 def b64_to_bytes(b64: str) -> bytes:
     import base64
-    return base64.b64decode(b64.encode("utf-8"))
-
-def safe_lower(s: str) -> str:
-    return (s or "").strip().lower()
+    # прибираємо пробіли/переноси — Railway інколи вставляє з переносами
+    b64_clean = "".join((b64 or "").split())
+    return base64.b64decode(b64_clean.encode("utf-8"))
 
 
 # =====================
@@ -328,18 +337,18 @@ def append_row_by_header(ws, row_dict: dict):
 
 
 # =====================
-# DRIVE UPLOAD (Service Account)
+# DRIVE UPLOAD
 # =====================
 def normalize_filename(shoot_date_ddmmyyyy: str, shoot_time: str, model_name: str, phone: str) -> str:
-    safe_name = re.sub(r"[^A-Za-z0-9]+", "_", model_name.strip()).strip("_")
-    safe_phone = re.sub(r"[^0-9]+", "", phone.strip())
-    safe_time = shoot_time.replace(":", "-")
-    safe_date = shoot_date_ddmmyyyy.replace(".", "-")
+    safe_name = re.sub(r"[^A-Za-z0-9]+", "_", (model_name or "").strip()).strip("_")
+    safe_phone = re.sub(r"[^0-9]+", "", (phone or "").strip())
+    safe_time = (shoot_time or "").replace(":", "-")
+    safe_date = (shoot_date_ddmmyyyy or "").replace(".", "-")
     return f"{safe_date}_{safe_time}_{safe_name}_{safe_phone}.jpg"
 
 async def upload_photo_to_drive_service_account(bot: Bot, file_id: str, filename: str) -> str:
     if not DRIVE_FOLDER_ID:
-        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is empty in .env / Railway variables")
+        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is empty in Railway Variables")
 
     drive = drive_service()
 
@@ -353,7 +362,7 @@ async def upload_photo_to_drive_service_account(bot: Bot, file_id: str, filename
     created = drive.files().create(
         body=metadata,
         media_body=media,
-        fields="id,webViewLink",
+        fields="id, webViewLink",
         supportsAllDrives=True,
     ).execute()
 
@@ -361,7 +370,7 @@ async def upload_photo_to_drive_service_account(bot: Bot, file_id: str, filename
 
 
 # =====================
-# STATUS WATCHER (manager workflow)
+# STATUS WATCHER
 # =====================
 async def status_watcher(bot: Bot):
     await asyncio.sleep(3)
@@ -371,10 +380,11 @@ async def status_watcher(bot: Bot):
             gc = sheets_client()
             sh = gc.open_by_key(SHEET_ID)
 
-            worksheets = sh.worksheets()
-            for ws in worksheets:
+            for ws in sh.worksheets():
                 hdr = ws.row_values(1)
-                if not hdr or "Status" not in hdr or "TelegramChatId" not in hdr:
+                if not hdr:
+                    continue
+                if "Status" not in hdr or "TelegramChatId" not in hdr or "NotifiedAt" not in hdr:
                     continue
 
                 hm = header_map(ws)
@@ -388,6 +398,7 @@ async def status_watcher(bot: Bot):
                     continue
 
                 all_rows = ws.get_all_values()
+
                 for r_i in range(2, len(all_rows) + 1):  # 1-based row index
                     row = all_rows[r_i - 1]
 
@@ -395,8 +406,8 @@ async def status_watcher(bot: Bot):
                         return row[col_num - 1] if col_num - 1 < len(row) else ""
 
                     status = safe_lower(get_by_col(status_col))
-                    notified = get_by_col(notified_col).strip()
-                    chat_id = get_by_col(chat_col).strip()
+                    notified = (get_by_col(notified_col) or "").strip()
+                    chat_id = (get_by_col(chat_col) or "").strip()
 
                     if not chat_id:
                         continue
@@ -405,11 +416,13 @@ async def status_watcher(bot: Bot):
                     if status not in {"approved", "rejected"}:
                         continue
 
-                    shoot_date = get_by_col(date_col).strip() if date_col else ""
-                    shoot_time = get_by_col(time_col).strip() if time_col else ""
+                    shoot_date = (get_by_col(date_col) or "").strip() if date_col else ""
+                    shoot_time = (get_by_col(time_col) or "").strip() if time_col else ""
 
                     if status == "approved":
                         text = APPROVED_TEXT.format(shoot_date=shoot_date, shoot_time=shoot_time)
+                        if shoot_date in LOCATION_DATES_MMDDYYYY:
+                            text += APPROVED_LOCATION_10_11
                     else:
                         text = REJECTED_TEXT
 
@@ -420,8 +433,9 @@ async def status_watcher(bot: Bot):
 
                     ws.update_cell(r_i, notified_col, now_iso())
 
-        except Exception:
-            pass
+        except Exception as e:
+            # щоб не валився процес у Railway
+            print("status_watcher error:", type(e).__name__, str(e))
 
         await asyncio.sleep(STATUS_CHECK_INTERVAL_SEC)
 
@@ -437,10 +451,7 @@ async def cmd_start(message: Message, state: FSMContext):
 async def on_begin(call: CallbackQuery, state: FSMContext):
     await call.answer()
     await state.clear()
-    await call.message.answer(
-        "Чудово! 😊 Почнемо.\n\nОберіть, будь ласка, дату зйомки 📅",
-        reply_markup=kb_dates()
-    )
+    await call.message.answer("Чудово! 😊 Почнемо.\n\nОберіть, будь ласка, дату зйомки 📅", reply_markup=kb_dates())
     await state.set_state(Form.shoot_date)
 
 async def on_date(call: CallbackQuery, state: FSMContext):
@@ -462,7 +473,7 @@ async def on_time(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 async def on_model_name(message: Message, state: FSMContext):
-    text = message.text.strip()
+    text = (message.text or "").strip()
     if not is_en(text):
         await message.answer("Трошки не так 🙂 Введіть, будь ласка, англійською. Приклад: Anna Ivanova")
         return
@@ -492,7 +503,7 @@ async def on_model_name(message: Message, state: FSMContext):
     await state.set_state(Form.dob)
 
 async def on_dob(message: Message, state: FSMContext):
-    text = message.text.strip()
+    text = (message.text or "").strip()
     if not is_dob_ua(text):
         await message.answer("Майже 🙂 Формат має бути: день.місяць.рік. Приклад: 22.12.1998")
         return
@@ -509,7 +520,7 @@ async def on_dob(message: Message, state: FSMContext):
     await state.set_state(Form.residence_address)
 
 async def on_residence_address(message: Message, state: FSMContext):
-    text = message.text.strip()
+    text = (message.text or "").strip()
 
     if is_next_ua(text):
         await state.update_data(residence_address="", city="")
@@ -534,7 +545,7 @@ async def on_residence_address(message: Message, state: FSMContext):
     await state.set_state(Form.city)
 
 async def on_city(message: Message, state: FSMContext):
-    text = message.text.strip()
+    text = (message.text or "").strip()
     if not is_en(text):
         await message.answer("Будь ласка, англійською 💛 Приклад: Kyiv")
         return
@@ -544,7 +555,7 @@ async def on_city(message: Message, state: FSMContext):
     await state.set_state(Form.phone)
 
 async def on_phone(message: Message, state: FSMContext):
-    text = message.text.strip()
+    text = (message.text or "").strip()
     if not is_phone(text):
         await message.answer("Майже 🙂 Номер має виглядати ось так: 380931111111 (тільки цифри)")
         return
@@ -553,7 +564,7 @@ async def on_phone(message: Message, state: FSMContext):
     await state.set_state(Form.email)
 
 async def on_email(message: Message, state: FSMContext):
-    text = message.text.strip()
+    text = (message.text or "").strip()
     if not is_email(text):
         await message.answer("Схоже, email написаний з помилкою 🙂 Приклад: name@gmail.com")
         return
@@ -582,7 +593,7 @@ async def on_minor(call: CallbackQuery, state: FSMContext):
         await state.set_state(Form.photo)
 
 async def on_guardian_name(message: Message, state: FSMContext):
-    text = message.text.strip()
+    text = (message.text or "").strip()
     if not is_en(text):
         await message.answer("Будь ласка, англійською 💛 Приклад: Olha Ivanova")
         return
@@ -619,6 +630,7 @@ async def on_photo(message: Message, state: FSMContext, bot: Bot):
             "Спробуйте ще раз або напишіть адміну.\n\n"
             f"Технічна помилка: {type(e).__name__}"
         )
+        print("upload error:", type(e).__name__, str(e))
         return
 
     await state.update_data(photo_drive_url=drive_url)
@@ -658,7 +670,7 @@ async def on_consent(call: CallbackQuery, state: FSMContext):
         await state.clear()
         return
 
-    submitted_at = now_submitted_kv()
+    submitted_at = kyiv_submitted_at()
 
     row_dict = {
         "Nameprint": NAMEPRINT_CONST,
@@ -708,11 +720,11 @@ async def on_more(call: CallbackQuery, state: FSMContext):
 # =====================
 async def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is empty in .env")
+        raise RuntimeError("BOT_TOKEN is empty in Railway Variables")
     if not SHEET_ID:
-        raise RuntimeError("GOOGLE_SHEET_ID is empty in .env")
+        raise RuntimeError("GOOGLE_SHEET_ID is empty in Railway Variables")
     if not DRIVE_FOLDER_ID:
-        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is empty in .env")
+        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is empty in Railway Variables")
     if not SERVICE_ACCOUNT_JSON_B64:
         raise RuntimeError("SERVICE_ACCOUNT_JSON_B64 is empty in Railway Variables")
 
@@ -742,7 +754,6 @@ async def main():
 
     dp.callback_query.register(on_more, F.data.startswith("more:"))
 
-    # запуск статус-воркера
     asyncio.create_task(status_watcher(bot))
 
     await dp.start_polling(bot)
