@@ -56,6 +56,8 @@ SHOOTPLACE_CONST = "Ukraine"
 SHOOTSTATE_CONST = "Kyiv"
 COUNTRY_CONST = "Ukraine"
 
+TZ_KYIV = ZoneInfo("Europe/Kyiv")
+
 # ГОЛОВНЕ: заголовки таблиці (в кожній вкладці-дні)
 HEADER = [
     "Nameprint",
@@ -100,6 +102,7 @@ UA_INTRO = (
     "• Адреса проживання необовʼязкова — менеджер зможе уточнити це пізніше 💛\n\n"
     "До речі, можна приходити з родичами — будемо раді всім 😊"
 )
+
 UA_READY = "Коли будете готові — натисніть кнопку нижче 👇"
 
 UA_FINISH = (
@@ -111,7 +114,7 @@ UA_FINISH = (
 )
 
 APPROVED_TEXT = (
-    "Вітаю! Ваша заявку **ПІДТВЕРДЖЕНО** ✅\n"
+    "Вітаю! Вашу заявку **ПІДТВЕРДЖЕНО** ✅\n"
     "📅 Дата: {shoot_date}\n"
     "🕒 Час: {shoot_time}\n\n"
     "Ми надішлемо деталі по локації ближче до дати зйомки 💛"
@@ -171,6 +174,9 @@ def missing_required(data: dict, keys: list[str]) -> bool:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+def now_submitted_kv() -> str:
+    return datetime.now(TZ_KYIV).strftime("%m/%d/%Y %H:%M")
 
 def b64_to_bytes(b64: str) -> bytes:
     import base64
@@ -282,7 +288,6 @@ def ensure_sheet_tab(gc: gspread.Client, sheet_id: str, shoot_date_mmddyyyy: str
         ws = sh.add_worksheet(title=tab, rows=2000, cols=60)
         ws.append_row(HEADER)
 
-    # перевіримо/додамо колонки, якщо хтось руками “поїхав”
     current_header = ws.row_values(1)
     if not current_header:
         ws.append_row(HEADER)
@@ -290,7 +295,6 @@ def ensure_sheet_tab(gc: gspread.Client, sheet_id: str, shoot_date_mmddyyyy: str
 
     missing = [h for h in HEADER if h not in current_header]
     if missing:
-        # додаємо відсутні заголовки в кінець
         new_header = current_header + missing
         ws.resize(rows=max(ws.row_count, 2000), cols=max(ws.col_count, len(new_header) + 5))
         ws.update("1:1", [new_header])
@@ -318,9 +322,6 @@ def model_exists_in_tab(ws, model_name: str) -> bool:
     return False
 
 def append_row_by_header(ws, row_dict: dict):
-    """
-    Надійно: збираємо рядок у порядку поточного header, а не по “індексах”.
-    """
     hdr = ws.row_values(1)
     row = [row_dict.get(h, "") for h in hdr]
     ws.append_row(row, value_input_option="RAW")
@@ -352,7 +353,7 @@ async def upload_photo_to_drive_service_account(bot: Bot, file_id: str, filename
     created = drive.files().create(
         body=metadata,
         media_body=media,
-        fields="id, webViewLink",
+        fields="id,webViewLink",
         supportsAllDrives=True,
     ).execute()
 
@@ -363,13 +364,7 @@ async def upload_photo_to_drive_service_account(bot: Bot, file_id: str, filename
 # STATUS WATCHER (manager workflow)
 # =====================
 async def status_watcher(bot: Bot):
-    """
-    Кожні STATUS_CHECK_INTERVAL_SEC:
-    - пробігається по всіх вкладках
-    - якщо Status = approved/rejected і NotifiedAt пустий -> шле повідомлення в TelegramChatId
-    - ставить NotifiedAt = now_iso()
-    """
-    await asyncio.sleep(3)  # маленька пауза після старту
+    await asyncio.sleep(3)
 
     while True:
         try:
@@ -378,7 +373,6 @@ async def status_watcher(bot: Bot):
 
             worksheets = sh.worksheets()
             for ws in worksheets:
-                # пропускаємо вкладки без хедера
                 hdr = ws.row_values(1)
                 if not hdr or "Status" not in hdr or "TelegramChatId" not in hdr:
                     continue
@@ -393,7 +387,6 @@ async def status_watcher(bot: Bot):
                 if not (status_col and notified_col and chat_col):
                     continue
 
-                # беремо всі рядки разом (простіш ніж col_values, бо “колонки їздили”)
                 all_rows = ws.get_all_values()
                 for r_i in range(2, len(all_rows) + 1):  # 1-based row index
                     row = all_rows[r_i - 1]
@@ -420,18 +413,14 @@ async def status_watcher(bot: Bot):
                     else:
                         text = REJECTED_TEXT
 
-                    # відправляємо
                     try:
                         await bot.send_message(int(chat_id), text, parse_mode="Markdown")
                     except Exception:
-                        # якщо не можемо написати — не помічаємо, щоб менеджер міг поправити chat_id
                         continue
 
-                    # пишемо NotifiedAt
                     ws.update_cell(r_i, notified_col, now_iso())
 
         except Exception:
-            # не валимо процес — просто пробуємо знову
             pass
 
         await asyncio.sleep(STATUS_CHECK_INTERVAL_SEC)
@@ -448,7 +437,10 @@ async def cmd_start(message: Message, state: FSMContext):
 async def on_begin(call: CallbackQuery, state: FSMContext):
     await call.answer()
     await state.clear()
-    await call.message.answer("Чудово! 😊 Почнемо.\n\nОберіть, будь ласка, дату зйомки 📅", reply_markup=kb_dates())
+    await call.message.answer(
+        "Чудово! 😊 Почнемо.\n\nОберіть, будь ласка, дату зйомки 📅",
+        reply_markup=kb_dates()
+    )
     await state.set_state(Form.shoot_date)
 
 async def on_date(call: CallbackQuery, state: FSMContext):
@@ -665,9 +657,8 @@ async def on_consent(call: CallbackQuery, state: FSMContext):
         )
         await state.clear()
         return
-submitted_at = datetime.now(
-    ZoneInfo("Europe/Kyiv")
-).strftime("%m/%d/%Y %H:%M")
+
+    submitted_at = now_submitted_kv()
 
     row_dict = {
         "Nameprint": NAMEPRINT_CONST,
