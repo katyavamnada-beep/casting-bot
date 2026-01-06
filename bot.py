@@ -3,6 +3,7 @@ import re
 import json
 import asyncio
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
@@ -78,6 +79,7 @@ HEADER = [
     "TelegramChatId",
     "Status",
     "NotifiedAt",
+    "SubmittedAt",
 ]
 
 
@@ -663,6 +665,9 @@ async def on_consent(call: CallbackQuery, state: FSMContext):
         )
         await state.clear()
         return
+submitted_at = datetime.now(
+    ZoneInfo("Europe/Kyiv")
+).strftime("%m/%d/%Y %H:%M")
 
     row_dict = {
         "Nameprint": NAMEPRINT_CONST,
@@ -686,6 +691,7 @@ async def on_consent(call: CallbackQuery, state: FSMContext):
         "TelegramChatId": str(call.from_user.id),
         "Status": "",
         "NotifiedAt": "",
+        "SubmittedAt": submitted_at,
     }
 
     append_row_by_header(ws, row_dict)
