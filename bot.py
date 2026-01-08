@@ -112,7 +112,7 @@ UA_FINISH = (
 APPROVED_TEXT = (
     "Вітаю! Вашу заявку **ПІДТВЕРДЖЕНО** ✅\n"
     "📅 Дата: {shoot_date}\n"
-    "🕒 Час: {shoot_time}\n\n"
+   
    
 )
 
