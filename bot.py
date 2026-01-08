@@ -111,9 +111,7 @@ UA_FINISH = (
 
 APPROVED_TEXT = (
     "Вітаю! Вашу заявку **ПІДТВЕРДЖЕНО** ✅\n"
-    "📅 Дата: {shoot_date}\n"
-   
-   
+    "📅 Дата зйомки: {shoot_date}\n\n"
 )
 
 REJECTED_TEXT = (
