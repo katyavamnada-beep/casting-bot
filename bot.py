@@ -38,7 +38,6 @@ STATUS_CHECK_INTERVAL_SEC = int(os.getenv("STATUS_CHECK_INTERVAL_SEC", "20"))
 # CONFIG
 # =====================
 DATES = [
-    "11.01.2026",
     "13.01.2026",
     "14.01.2026",
     "17.01.2026",
