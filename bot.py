@@ -38,14 +38,15 @@ STATUS_CHECK_INTERVAL_SEC = int(os.getenv("STATUS_CHECK_INTERVAL_SEC", "20"))
 # CONFIG
 # =====================
 DATES = [
-    "17.01.2026",
-    "18.01.2026",
+    "20.01.2026",
+    "21.01.2026",
     "23.01.2026",
     "27.01.2026",
     "28.01.2026",
     "29.01.2026",
     "31.01.2026",
 ]
+
 TIMES = ["10:20", "11:00", "11:40", "12:30", "13:20"]
 
 NAMEPRINT_CONST = "Stanislav Maspanov"
